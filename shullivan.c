@@ -1253,6 +1253,8 @@ printHelp (void)
 "import         - import a .ghi Ghilbert interface file\n"
 "       import (IFACEID path/to/basename ([PARAM_ID...]) \"PREFIX\")\n"
 "interfaces     - list imported interfaces\n"
+"isave          - save history as a .ghi file\n"
+"       isave (FILENAME [START_HISTNUM])\n"
 "keep           - Toggle retention of proof steps.\n"
 "kindbind       - kindbind with .gh file semantics\n"
 "       kindbind (OLDKIND NEWKIND)\n"
@@ -1583,8 +1585,12 @@ dvEnumerate (int nvars, uint32_t * dvbits, DV_ENUMERATE_FUNC f, void * ctx)
 	return NULL;
 }
 
+#define PRINT_HISTNUM	1  /* applies to histPrint() */
 #define PRINT_AS_THM	2
 #define ABBREV_PROOF	4
+#define PRINT_AS_GHI	8
+#define PRINT_ONLY_THM	16 /* applies to histPrint() */
+#define PRINT_INTERNAL	32 /* applies to histPrint() */
 
 static void
 statementPrint (FILE * f, STATEMENT * s, int verbose)
@@ -1602,7 +1608,10 @@ statementPrint (FILE * f, STATEMENT * s, int verbose)
 	indent = (verbose >> 16);
 	verbose &= 0xffff;
 
-	if ((verbose & PRINT_AS_THM) != 0 && s->thm != NULL)
+	if ((verbose & PRINT_AS_THM) && s->thm == NULL)
+		verbose &= ~PRINT_AS_THM;
+
+	if (verbose & PRINT_AS_THM)
 		fprintf (f, "%*sthm  (%s (", indent, "", s->sym.ident->name);
 	else
 		fprintf (f, "%*sstmt (%s (", indent, "", s->sym.ident->name);
@@ -1624,7 +1633,7 @@ statementPrint (FILE * f, STATEMENT * s, int verbose)
 	for (i = 0; i < s->nHyps; ++i) {
 		fprintf (f, "%s", space);
 		space = " ";
-		if (verbose > 1 && s->thm != NULL) {
+		if (verbose & PRINT_AS_THM) {
 			fprintf (f, "(%s ", s->thm->hypnam[i]->name);
 			exprPrint (f, s->hyps[i]);
 			fprintf (f, ")");
@@ -1650,7 +1659,7 @@ statementPrint (FILE * f, STATEMENT * s, int verbose)
 	}
 	if ((verbose & ABBREV_PROOF) != 0) {
 		fprintf (f, " ...");
-	} else if ((verbose & PRINT_AS_THM) != 0 && s->thm != NULL) {
+	} else if (verbose & PRINT_AS_THM) {
 		THEOREM * t = s->thm;
 		PROOF_STEP * s;
 		fprintf (f, "\n%*s(", indent, "");
@@ -4246,11 +4255,21 @@ ifacePrint (FILE * f, SHULLIVAN * shul, INTERFACE * iface, int verbose)
 {
 	INTERFACE * param;
 	int i;
+	char * tag;
 
 	assert (iface != NULL);
 
+	if (verbose & PRINT_AS_GHI) {
+		verbose &= ~PRINT_AS_GHI;
+		tag = "param";
+	} else if (iface->import)
+		tag = "import";
+	else
+		tag = "export";
+			
+
 	fprintf (f, "%s (%s %s (", 
-		 iface->import ? "import" : "export",
+		 tag,
 		 iface->sym.ident->name,
 		 iface->fileId->name);
 
@@ -4575,6 +4594,7 @@ flags (SHULLIVAN * shul, ITEM * sexpr)
 	return 0;
 }
 
+
 static int
 histPrint (FILE * f, SHULLIVAN * shul, 
 	   unsigned long start, unsigned long stop, int verbose)
@@ -4592,37 +4612,39 @@ histPrint (FILE * f, SHULLIVAN * shul,
 	for (i = start; i < stop; ++i) {
 		hi = &shul->history[i / HISTORY_CHUNK_SIZE]->
 			h[i % HISTORY_CHUNK_SIZE];
-		if (verbose)
+		if (verbose & PRINT_HISTNUM)
 			fprintf (f, "%lu. ", i);
 		switch (hi->htype) {
 		case HT_THM:
 			stat = hi->it;
-			if (!verbose && stat->thm == NULL)
+			if ((verbose & PRINT_ONLY_THM) && stat->thm == NULL)
 				continue;
-			statementPrint (f, hi->it, 
-					verbose ? (PRINT_AS_THM | 
-						   ABBREV_PROOF) :
-					PRINT_AS_THM);
+			statementPrint (f, hi->it, verbose);
 			break;
-		case HT_IMPORT:
 		case HT_EXPORT:
-			ifacePrint (f, shul, hi->it, 0);
+			if (verbose & PRINT_AS_GHI)
+				continue;
+			/* fall through */
+		case HT_IMPORT:
+			ifacePrint (f, shul, hi->it, verbose & PRINT_AS_GHI);
 			break;
 		case HT_VAROLDKIND:
-			if (verbose && hi->it != NULL)
+			if ((verbose & PRINT_INTERNAL) == 0)
+				continue;
+
+			if (hi->it != NULL)
 				fprintf (f, 
 					 "# The following var used to be of "
 					 "kind %s\n",
 					 ((KIND *)hi->it)->id->name);
-			if (verbose && hi->it == NULL)
+			else
 				fprintf (f, "# The following var is new.\n");
 			break;
 		case HT_VARNEWKIND:
 			assert (varkind == NULL);
 			varkind = hi->it;
-			if (verbose)
-				fprintf (f, 
-					 "# The following var is now of "
+			if (verbose & PRINT_INTERNAL)
+				fprintf (f, "# The following var is now of "
 					 "kind %s\n", varkind->id->name);
 			break;
 		case HT_VAR:
@@ -4639,7 +4661,7 @@ histPrint (FILE * f, SHULLIVAN * shul,
 		case HT_KINDBIND0:
 			assert (kind == NULL);
 			kind = hi->it;
-			if (verbose)
+			if (verbose & PRINT_INTERNAL)
 				fprintf (f, "# old kind %s\n", kind->id->name);
 			break;
 		case HT_KINDBIND:
@@ -4656,11 +4678,14 @@ histPrint (FILE * f, SHULLIVAN * shul,
 static int
 history (SHULLIVAN * shul, ITEM * ignored)
 {
-	return histPrint (stdout, shul, 0, shul->histlen, 1);
+	return histPrint (stdout, shul, 0, shul->histlen, 
+			  PRINT_HISTNUM | PRINT_INTERNAL | 
+			  PRINT_AS_THM | ABBREV_PROOF);
 }
 
 static int
-save (SHULLIVAN * shul, ITEM * item) {
+saveIt (SHULLIVAN * shul, ITEM * item, int verbose)
+{
 	ITEM * fileItem;
 	ITEM * numItem;
 	unsigned long start = 0;
@@ -4699,11 +4724,23 @@ saveSyntax:
 			 fileItem->id.id->name);
 		return -1;
 	}
-	ret = histPrint (f, shul, start, shul->histlen, 0);
+	ret = histPrint (f, shul, start, shul->histlen,	verbose);
 	ret2 = fclose (f);
 	if (ret != 0)
 		perror ("fclose");
 	return ret == 0 ? ret2 : ret;
+}
+
+static int
+save (SHULLIVAN * shul, ITEM * item)
+{
+	return saveIt (shul, item, PRINT_ONLY_THM | PRINT_AS_THM);
+}
+
+static int
+isave (SHULLIVAN * shul, ITEM * item)
+{
+	return saveIt (shul, item, PRINT_AS_GHI);
 }
 
 static int
@@ -5334,7 +5371,7 @@ load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
 	exprStackInit (&tip.mvs, &tip.arena);	/* mand. var. stack */
 
 	if ((thm->steps = arenaAlloc (&tip.arena,
-				      i * sizeof (PROOF_STEP))) == NULL) {
+				      i * sizeof (PROOF_STEP) + 1)) == NULL) {
 		perror ("load_thm:arenaAlloc[1]");
 		goto load_thm_bad2;
 	}
@@ -6101,6 +6138,9 @@ commandLookup (char * cmd, int cmdlen, int * pOpts)
 	}
 	if (strcmp (cmd, "import") == 0) {
 		return import;
+	}
+	if (strcmp (cmd, "isave") == 0) {
+		return isave;
 	}
 	if (strcmp (cmd, "kindbind") == 0) {
 		return kindbind;

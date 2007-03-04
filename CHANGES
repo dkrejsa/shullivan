@@ -1,0 +1,4 @@
+Changes in 0.03:
+ - Add isave command to allow saving history as a .ghi file.
+ - Fix a problem with 0-conclusion proofs introduced in 0.02.
+
