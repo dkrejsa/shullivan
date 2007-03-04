@@ -155,6 +155,12 @@ typedef struct _SHULLIVAN {
 	int saveProof;			/* if not 0, save proof info */
 
 	int verbose;			/* verbosity level */
+#define SHUL_VERB_PROGRESS	1	/* note import, export, thm verify */
+#define SHUL_VERB_COMMANDS	2	/* echo all commands */
+#define SHUL_VERB_PROOF		4	/* print all results in proof */
+#define SHUL_VERB_PRFMAND	8	/* print mandatory hyps in proof */
+#define SHUL_VERB_PRINT_PRETTY	16	/* pretty-print expressions */
+
 	unsigned long flags;
 
 #define MULTIPLE_CONCLUSIONS 1		/* Allow 0 or more conclusions */
@@ -170,7 +176,8 @@ typedef void * (*DV_ENUMERATE_FUNC) (int i, int j, void * ctx);
 static void * dvEnumerate (int nvars, uint32_t * dvbits,
 			   DV_ENUMERATE_FUNC f, void * ctx);
 static void sexpr_print (FILE * f, ITEM * item);
-static void exprPrint (FILE * f, EXPR * exp);
+static void exprPrint (FILE * f, EXPR * exp, unsigned long verbose, 
+		       int indent);
 static int port (SHULLIVAN * shul, ITEM * args, int importing);
 static void ifaceFree (SHULLIVAN * shul, INTERFACE * iface);
 
@@ -380,9 +387,9 @@ match (EXPR * e1, EXPR * e2, EXPR ** env)
 
 #if 0
 	printf ("match: ");
-	exprPrint (e1);
+	exprPrint (stdout, e1, 0, 0);
 	printf (" vs. ");
-	exprPrint (e2);
+	exprPrint (stdout, e2, 0, 0);
 	printf (" env %s\n", env ? "non-NULL" : "NULL");
 #endif
 
@@ -460,7 +467,7 @@ match (EXPR * e1, EXPR * e2, EXPR ** env)
 	if (env[e2->vi.index] == NULL) {
 #if 0
 		printf ("map %s (%d) to ", e2->vi.id->name, e2->vi.index);
-		exprPrint (e1);
+		exprPrint (stdout, e1, 0, 0);
 		printf ("\n");
 #endif
 		env[e2->vi.index] = e1;
@@ -763,6 +770,7 @@ proofStepApply (SHULLIVAN * shul, TIP * tip, PROOF_STEP * s)
 	int i;
 	int j;
 	int nvars;
+	int indent;
 
 	if (s->s.type == STEPT_HYP) {
 		if (tip->mvs.count != 0) {
@@ -772,8 +780,14 @@ proofStepApply (SHULLIVAN * shul, TIP * tip, PROOF_STEP * s)
 			return -1;
 		}
 
-		return exprStackPush (&tip->ps, 
-				      tip->t->stmt->hyps[s->hyp.index]);
+		i = s->hyp.index;
+		e1 = tip->t->stmt->hyps[i];
+		if (shul->verbose & SHUL_VERB_PROOF) {
+			j = printf ("H%d %s ", i+1, tip->t->hypnam[i]->name);
+			exprPrint (stdout, e1, shul->verbose, j);
+			printf ("\n");
+		}
+		return exprStackPush (&tip->ps, e1);
 	}
 
 	if (s->s.type == STEPT_EXPR) {
@@ -784,6 +798,11 @@ proofStepApply (SHULLIVAN * shul, TIP * tip, PROOF_STEP * s)
 		 * left on the mvs stack at the end of the proof, a
 		 * warning is generated.
 		 */
+		if (shul->verbose & SHUL_VERB_PRFMAND) {
+			j = printf ("M  ");
+			exprPrint (stdout, s->expr.x, shul->verbose, j);
+			printf ("\n");
+		}
 		return exprStackPush (&tip->mvs, s->expr.x);
 	}
 
@@ -863,7 +882,7 @@ proofStepApply (SHULLIVAN * shul, TIP * tip, PROOF_STEP * s)
 		env[i+j] = tip->mvs.exprs[i];
 #if 0
 		printf ("mv map %s (%d) to ", stat->vi[i+j].id->name, i+j);
-		exprPrint (tip->mvs.exprs[i]);
+		exprPrint (stdout, tip->mvs.exprs[i], 0, 0);
 		printf ("\n");
 #endif
 	}
@@ -914,10 +933,26 @@ proofStepApply (SHULLIVAN * shul, TIP * tip, PROOF_STEP * s)
 
 	tip->ps.count -= stat->nHyps;
 
+	indent = 0;
+	if (shul->verbose & SHUL_VERB_PROOF) {
+		if (stat->nCons == 0)
+			printf ("-%d %s\n", stat->nHyps, 
+				stat->sym.ident->name);
+		else
+			indent = printf ("-%d %s ", stat->nHyps,
+					 stat->sym.ident->name);
+	}
+
 	for (i = 0; i < stat->nCons; ++i, ++j) {
 		e1 = specialize (stat->cons[i], env, &tip->arena);
 		if (e1 == NULL)
 			return -1;
+		if (shul->verbose & SHUL_VERB_PROOF) {
+			if (i != 0)
+				indent = printf ("+  ");
+			exprPrint (stdout, e1, shul->verbose, indent);
+			printf ("\n");
+		}
 		if (exprStackPush (&tip->ps, e1) != 0)
 			return -1;
 	}
@@ -1493,10 +1528,36 @@ fileScannerClose (SCANNER * scan)
 	scan->ctx = NULL; /* invalidate */
 }
 
+#define MAX_FLAT_DEPTH 2
+
+static int
+exprDepth (EXPR * exp)
+{
+	int max;
+	int i;
+	int depth;
+
+	if (exp->ex.etype != ET_SEXPR)
+		return 0;
+
+	max = 0;
+	for (i = 0; i < exp->sx.t->arity; ++i) {
+		depth = exprDepth (exp->sx.args[i]);
+		if (depth > max) {
+			max = depth;
+			if (depth >= MAX_FLAT_DEPTH)
+				return depth + 1;
+		}
+	}
+
+	return (max + 1);
+}
+
 static void
-exprPrint (FILE * f, EXPR * exp)
+exprPrint (FILE * f, EXPR * exp, unsigned long verbose, int indent)
 {
 	int i;
+	int depth;
 
 	switch (exp->ex.etype) {
 	case ET_IVAR:
@@ -1504,9 +1565,27 @@ exprPrint (FILE * f, EXPR * exp)
 		break;
 	case ET_SEXPR:
 		fprintf (f, "(%s", exp->sx.t->sym.ident->name);
-		for (i = 0; i < exp->sx.t->arity; ++i) {
-			fprintf (f, " ");
-			exprPrint (f, exp->sx.args[i]);
+		if (verbose & SHUL_VERB_PRINT_PRETTY) {
+			depth = exprDepth (exp); /* ugh, double recurse */
+			if (depth <= MAX_FLAT_DEPTH)
+				goto exprPrintFlat;
+
+			indent += 2 + exp->sx.t->sym.ident->idlen;
+			for (i = 0; i < exp->sx.t->arity; ++i) {
+				if (i == 0)
+					fprintf (f, " ");
+				else
+					fprintf (f, "\n%*s", indent, "");
+				exprPrint (f, exp->sx.args[i], 
+					   verbose, indent);
+			}
+		} else {
+exprPrintFlat:
+			for (i = 0; i < exp->sx.t->arity; ++i) {
+				fprintf (f, " ");
+				exprPrint (f, exp->sx.args[i], 
+					   verbose, indent);
+			}
 		}
 		fprintf (f, ")");
 		break;
@@ -1586,19 +1665,24 @@ dvEnumerate (int nvars, uint32_t * dvbits, DV_ENUMERATE_FUNC f, void * ctx)
 }
 
 #define PRINT_HISTNUM	1  /* applies to histPrint() */
+#define PRINT_VERBOSE   1  /* applies to statementPrint() */
 #define PRINT_AS_THM	2
 #define ABBREV_PROOF	4
 #define PRINT_AS_GHI	8
 #define PRINT_ONLY_THM	16 /* applies to histPrint() */
 #define PRINT_INTERNAL	32 /* applies to histPrint() */
+#define PRINT_PRETTY	64
+#define PRINT_DEF_AS_TERM 128  /* applies to histPrint() */
 
 static void
-statementPrint (FILE * f, STATEMENT * s, int verbose)
+statementPrint (FILE * f, STATEMENT * s, unsigned long verbose)
 {
 	int indent;
 	char * space;
 	int i;
 	STATDVPRINT sp;
+	int j;
+	unsigned long exprVerbose;
 
 	if (verbose == 0) {
 		fprintf (f, " %s", s->sym.ident->name);
@@ -1612,53 +1696,66 @@ statementPrint (FILE * f, STATEMENT * s, int verbose)
 		verbose &= ~PRINT_AS_THM;
 
 	if (verbose & PRINT_AS_THM)
-		fprintf (f, "%*sthm  (%s (", indent, "", s->sym.ident->name);
+		indent += fprintf (f, "thm  (%s (", s->sym.ident->name);
 	else
-		fprintf (f, "%*sstmt (%s (", indent, "", s->sym.ident->name);
-	indent += strlen (s->sym.ident->name) + 7;
+		indent += fprintf (f, "stmt (%s (", s->sym.ident->name);
 
-	if (s->dvbits != NULL) {
+	if (s->dvbits != NULL || (verbose & PRINT_PRETTY)) {
 		space = "";
 		sp.space = &space;
 		sp.s = s;
 		sp.f = f;
 		dvEnumerate (s->nhvars + s->nMand, s->dvbits,
 			     dvPairPrint, &sp);
-		fprintf (f, ")\n%*s(", indent, "");
+		fprintf (f, ")\n%*s(", indent - 1, "");
 	} else {
-		fprintf (f, ") (");
+		indent += fprintf (f, ") (");
 	}
 
-	space = "";
+	exprVerbose = (verbose & PRINT_PRETTY) ? SHUL_VERB_PRINT_PRETTY : 0;
+
 	for (i = 0; i < s->nHyps; ++i) {
-		fprintf (f, "%s", space);
-		space = " ";
+		if (i != 0) {
+			if (verbose & PRINT_PRETTY)
+				fprintf (f, "\n%*s", indent, "");
+			else
+				fprintf (f, " ");
+		}
 		if (verbose & PRINT_AS_THM) {
-			fprintf (f, "(%s ", s->thm->hypnam[i]->name);
-			exprPrint (f, s->hyps[i]);
+			j = fprintf (f, "(%s ", s->thm->hypnam[i]->name);
+			exprPrint (f, s->hyps[i], exprVerbose, indent + j);
 			fprintf (f, ")");
 		} else
-			exprPrint (f, s->hyps[i]);
+			exprPrint (f, s->hyps[i], exprVerbose, indent);
 	}
-	if (i != 0)
-		fprintf (f, ")\n%*s", indent, "");
-	else
-		fprintf (f, ") ");
-	if (s->nCons != 1) {
+	if (i != 0 || (verbose & PRINT_PRETTY) != 0)
+		fprintf (f, ")\n%*s", indent - 1, "");
+	else {
+		indent += fprintf (f, ") ");
+	}
+	if (s->nCons != 1)
 		fprintf (f, "(");
-	}
+	else
+		indent--;
 
-	space = "";
 	for (i = 0; i < s->nCons; ++i) {
-		fprintf (f, "%s", space);
-		space = " ";
-		exprPrint (f, s->cons[i]);
+		if (i != 0) {
+			if (verbose & PRINT_PRETTY)
+				fprintf (f, "\n%*s", indent, "");
+			else
+				fprintf (f, " ");
+		}
+		exprPrint (f, s->cons[i], exprVerbose, indent);
 	}
 	if (s->nCons != 1) {
+		indent--;
 		fprintf (f, ")");
 	}
 	if ((verbose & ABBREV_PROOF) != 0) {
-		fprintf (f, " ...");
+		if (verbose & PRINT_PRETTY)
+			fprintf (f, "\n%*s...", indent, "");
+		else
+			fprintf (f, " ...");
 	} else if (verbose & PRINT_AS_THM) {
 		THEOREM * t = s->thm;
 		PROOF_STEP * s;
@@ -1669,7 +1766,7 @@ statementPrint (FILE * f, STATEMENT * s, int verbose)
 			space = " ";
 			s = &t->steps[i];
 			if (s->s.type == STEPT_EXPR)
-				exprPrint (f, s->expr.x);
+				exprPrint (f, s->expr.x, 0, 0);
 			else if (s->s.type == STEPT_REF)
 				fprintf (f, "%s",
 					 s->ref.stat->sym.ident->name);
@@ -1682,14 +1779,21 @@ statementPrint (FILE * f, STATEMENT * s, int verbose)
 	fprintf (f, ")\n");
 }
 
+typedef struct _STAT_PRINTME_CTX {
+	INTERFACE * iface;
+	unsigned long verbose;
+} STAT_PRINTME_CTX;
+
 static void *
 statementPrintMe (void * ctx, MAP_ELEM * me)
 {
-	INTERFACE * iface = ctx;
+	STAT_PRINTME_CTX * pmc = ctx;
 	STATEMENT * stat = me->v.p;
 
-	if (stat->sym.stype == ST_STMT && stat->iface == iface)
-		statementPrint (stdout, stat, 1 | (2 << 16));
+	if (stat->sym.stype == ST_STMT && stat->iface == pmc->iface) {
+		printf ("  ");
+		statementPrint (stdout, stat, pmc->verbose);
+	}
 
 	return NULL;
 }
@@ -1700,18 +1804,25 @@ statementList (SHULLIVAN * shul, ITEM * ignored)
 	unsigned long i;
 	HISTORY_ITEM * hi;
 	INTERFACE * iface;
+	STAT_PRINTME_CTX pmc;
+
+	pmc.verbose = PRINT_VERBOSE | (2 << 16); /* 2 spaces indent */
+	if (shul->verbose & SHUL_VERB_PRINT_PRETTY)
+		pmc.verbose |= PRINT_PRETTY;
 
 	for (i = 0; i < shul->histlen; ++i) {
 		hi = &shul->history[i / HISTORY_CHUNK_SIZE]->
 			h[i % HISTORY_CHUNK_SIZE];
 		if (hi->htype == HT_THM)
-			statementPrint (stdout, (STATEMENT *)hi->it, 1);
+			statementPrint (stdout, (STATEMENT *)hi->it, 
+				pmc.verbose & 0xffff);
 		else if (hi->htype == HT_IMPORT) {
 			iface = hi->it;
+			pmc.iface = iface;
 			printf ("From %s :\n",
 				iface->sym.ident->name);
 			mappingEnumerate (shul->syms,
-					  statementPrintMe, iface);
+					  statementPrintMe, &pmc);
 		}
 	}
 	return 0;
@@ -2071,7 +2182,7 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 	}
 
 	if (hypnams) {
-		if (shul->verbose >= 1) {
+		if (shul->verbose & SHUL_VERB_PROGRESS) {
 			printf ("verifying %s\n", nameItem->id.id->name);
 			fflush (stdout);
 		}
@@ -2147,7 +2258,7 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 			if (me->v.i != -1) {
 				fprintf (stderr,
 				 "*** Hypothesis name '%s' occurs "
-				 "twice.\n", (char *)me->obj);
+				 "twice.\n", hypnamItem->id.id->name);
 				goto parseStatement_bad2;
 			}
 			me->v.i = nhyps;
@@ -2452,7 +2563,7 @@ exprCheck (ITEM * item, EXPR * exp, EXPR_PARSE_CONTEXT * ctx, KIND * knownKind)
 	fprintf (stderr, "exprCheck ");
 	sexpr_print (stderr, item);
 	fprintf (stderr, "  vs.  ");
-	exprPrint (stderr, exp);
+	exprPrint (stderr, exp, 0, 0);
 	fprintf (stderr, "\n");
 #endif
 
@@ -3790,7 +3901,7 @@ fileProcess (SHULLIVAN * shul, ITEM * fileItem,
 			goto fileCleanup;
 		}
 
-		if (shul->verbose > 10) {
+		if (shul->verbose & SHUL_VERB_COMMANDS) {
 			printf ("%s %s ", dbgPrefix, cmd);
 		}
 
@@ -3800,7 +3911,7 @@ fileProcess (SHULLIVAN * shul, ITEM * fileItem,
 			goto fileCleanup;
 		}
 
-		if (shul->verbose > 10) {
+		if (shul->verbose & SHUL_VERB_COMMANDS) {
 			sexpr_print (stdout, item);
 			printf ("\n");
 		}
@@ -3942,7 +4053,7 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 		fprintf (stderr, "*** Malformed import/export s-expression\n");
 		return -1;
 	}
-	if (shul->verbose > 0) {
+	if (shul->verbose & SHUL_VERB_PROGRESS) {
 		printf ("%sporting %s\n", importing ? "Im" : "Ex",
 			 nameItem->id.id->name);
 		fflush (stdout);
@@ -4417,24 +4528,29 @@ identifierList (SHULLIVAN * shul, ITEM * ignored)
 	return 0;
 }
 
+static void
+termPrint (FILE * f, TERM * term)
+{
+	int i;
+	fprintf (f, "term (%s (%s", term->kind->id->name, 
+		 term->sym.ident->name);
+	for (i = 0; i < term->arity; ++i)
+		fprintf (f, " %s", term->kinds[i]->id->name);
+	fprintf (f, "))\n");
+}
+
 static void *
-termPrint (void * ctx, MAP_ELEM * me)
+termPrintMe (void * ctx, MAP_ELEM * me)
 {
 	TERM * term = me->v.p;
-	int i;
-	IDENT * id = me->obj;
-
-	printf ("(%s (%s", term->kind->id->name, id->name);
-	for (i = 0; i < term->arity; ++i)
-		printf (" %s", term->kinds[i]->id->name);
-	printf ("))\n");
+	termPrint (stdout, term);
 	return NULL;
 }
 
 static int
 termList (SHULLIVAN * shul, ITEM * ignored)
 {
-	(void)mappingEnumerate (shul->terms, termPrint, shul);
+	(void)mappingEnumerate (shul->terms, termPrintMe, shul);
 	return 0;
 }
 
@@ -4452,7 +4568,7 @@ defPrint (FILE * f, DEF * def)
 
 	fprintf (f, ") ");
 
-	exprPrint (f, def->expr);
+	exprPrint (f, def->expr, 0, 0);
 
 	fprintf (f, ")\n");
 }
@@ -4556,7 +4672,7 @@ verbose (SHULLIVAN * shul, ITEM * sexpr)
 	verb = strtol (sexpr->id.id->name, &stop, 0);
 	if (stop != sexpr->id.id->name)
 		shul->verbose = verb;
-	printf ("Verbosity is %d.\n", shul->verbose);
+	printf ("Verbosity is 0x%x.\n", shul->verbose);
 	return 0;
 }
 
@@ -4605,6 +4721,8 @@ histPrint (FILE * f, SHULLIVAN * shul,
 	KIND * kind = NULL;
 	KIND * varkind = NULL;
 	STATEMENT * stat;
+	DEF * def;
+	int indent;
 
 	assert (shul != NULL && 
 		start <= shul->histlen && stop <= shul->histlen);
@@ -4612,14 +4730,15 @@ histPrint (FILE * f, SHULLIVAN * shul,
 	for (i = start; i < stop; ++i) {
 		hi = &shul->history[i / HISTORY_CHUNK_SIZE]->
 			h[i % HISTORY_CHUNK_SIZE];
+		indent = 0;
 		if (verbose & PRINT_HISTNUM)
-			fprintf (f, "%lu. ", i);
+			indent = fprintf (f, "%lu. ", i);
 		switch (hi->htype) {
 		case HT_THM:
 			stat = hi->it;
 			if ((verbose & PRINT_ONLY_THM) && stat->thm == NULL)
 				continue;
-			statementPrint (f, hi->it, verbose);
+			statementPrint (f, hi->it, verbose | (indent << 16));
 			break;
 		case HT_EXPORT:
 			if (verbose & PRINT_AS_GHI)
@@ -4656,7 +4775,11 @@ histPrint (FILE * f, SHULLIVAN * shul,
 			varkind = NULL;
 			break;
 		case HT_DEF:
-			defPrint (f, hi->it);
+			def = hi->it;
+			if (verbose & PRINT_DEF_AS_TERM)
+				termPrint (f, &def->t);
+			else
+				defPrint (f, def);
 			break;
 		case HT_KINDBIND0:
 			assert (kind == NULL);
@@ -4678,9 +4801,11 @@ histPrint (FILE * f, SHULLIVAN * shul,
 static int
 history (SHULLIVAN * shul, ITEM * ignored)
 {
-	return histPrint (stdout, shul, 0, shul->histlen, 
-			  PRINT_HISTNUM | PRINT_INTERNAL | 
-			  PRINT_AS_THM | ABBREV_PROOF);
+	int verbose = (PRINT_HISTNUM | PRINT_INTERNAL | 
+		       PRINT_AS_THM | ABBREV_PROOF);
+	if (shul->verbose & SHUL_VERB_PRINT_PRETTY)
+		verbose |= PRINT_PRETTY;
+	return histPrint (stdout, shul, 0, shul->histlen, verbose);
 }
 
 static int
@@ -4717,7 +4842,10 @@ saveSyntax:
 		}
 	}
 
-	f = fopen (fileItem->id.id->name, "w");
+	if (strcmp (fileItem->id.id->name, ".") == 0)
+		f = stdout;
+	else
+		f = fopen (fileItem->id.id->name, "w");
 	if (f == NULL) {
 		perror ("fopen");
 		fprintf (stderr, "*** Cannot open '%s' for writing.\n",
@@ -4725,7 +4853,9 @@ saveSyntax:
 		return -1;
 	}
 	ret = histPrint (f, shul, start, shul->histlen,	verbose);
-	ret2 = fclose (f);
+	ret2 = 0;
+	if (f != stdout)
+		ret2 = fclose (f);
 	if (ret != 0)
 		perror ("fclose");
 	return ret == 0 ? ret2 : ret;
@@ -4734,13 +4864,19 @@ saveSyntax:
 static int
 save (SHULLIVAN * shul, ITEM * item)
 {
-	return saveIt (shul, item, PRINT_ONLY_THM | PRINT_AS_THM);
+	int verbose = PRINT_ONLY_THM | PRINT_AS_THM;
+	if (shul->verbose & SHUL_VERB_PRINT_PRETTY)
+		verbose |= PRINT_PRETTY;
+	return saveIt (shul, item, verbose);
 }
 
 static int
 isave (SHULLIVAN * shul, ITEM * item)
 {
-	return saveIt (shul, item, PRINT_AS_GHI);
+	int verbose = PRINT_AS_GHI | PRINT_DEF_AS_TERM;
+	if (shul->verbose & SHUL_VERB_PRINT_PRETTY)
+		verbose |= PRINT_PRETTY;
+	return saveIt (shul, item, verbose);
 }
 
 static int
@@ -5091,7 +5227,7 @@ checkConclusion (EXPR * pse, EXPR * scon, EXPR ** env, EXPR * deftgt,
 
 #if 0
 	printf ("%s --> ", pse->vi.id->name);
-	exprPrint (stdout, deftgt);
+	exprPrint (stdout, deftgt, 0, 0);
 	printf ("\n");
 #endif
 	c->dvmap[pse->vi.index - c->nhvars].ex = deftgt;
@@ -5100,16 +5236,17 @@ checkConclusion (EXPR * pse, EXPR * scon, EXPR ** env, EXPR * deftgt,
 }
 
 static void
-tipShow (FILE * f, TIP * tip)
+tipShow (FILE * f, TIP * tip, unsigned long verbose)
 {
 	int i;
+	int indent;
 
 	if (tip->ps.count == 0)
 		fprintf (f, "Proof stack empty.\n");
 	else {
 		for (i = 0; i < tip->ps.count; ++i) {
-			fprintf (f, "PS%-3d ", i);
-			exprPrint (f, tip->ps.exprs[i]);
+			indent = fprintf (f, "PS%-3d ", i);
+			exprPrint (f, tip->ps.exprs[i], verbose, indent);
 			fprintf (f, "\n");
 		}
 	}
@@ -5117,8 +5254,8 @@ tipShow (FILE * f, TIP * tip)
 		fprintf (f, "MV stack empty.\n");
 	else {
 		for (i = 0; i < tip->mvs.count; ++i) {
-			fprintf (f, "MV%-3d ", i);
-			exprPrint (f, tip->mvs.exprs[i]);
+			indent = fprintf (f, "MV%-3d ", i);
+			exprPrint (f, tip->mvs.exprs[i], verbose, indent);
 			fprintf (f, "\n");
 		}
 	}
@@ -5636,7 +5773,7 @@ load_thm_bad3:
 
 	memset (shul->dvbits, 0, shul->dvsize);
 
-	tipShow (stderr, &tip);
+	tipShow (stderr, &tip, shul->verbose);
 
 	arenaFree (&tip.arena);
 
@@ -5653,7 +5790,7 @@ load_thm_bad0:
 		identTableDelete (sctx.hypnams);
 
 	if (!((LOAD_CONTEXT *)ctx)->interactive &&
-	    shul->verbose <= 10) {
+	    (shul->verbose & SHUL_VERB_COMMANDS) == 0) {
 		fprintf (stderr, "thm ");
 		sexpr_print (stderr, arg);
 		fprintf (stderr, "\n");

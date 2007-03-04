@@ -3,7 +3,7 @@
 #ifndef __INCshullivanh
 #define __INCshullivanh
 
-#define SHULLIVAN_VERSION "0.03"
+#define SHULLIVAN_VERSION "0.04"
 
 /*
  * Lexical items - identifiers and s-lists
