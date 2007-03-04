@@ -18,6 +18,15 @@ typedef struct _ARENA {
 	ARENA_BLK ** backing;
 } ARENA;
 
+/*
+ * Memory allocations from an arena have their sizes rounded up to a
+ * multiple of ARENA_ALIGN bytes.
+ */
+#define ARENA_ALIGN	8
+
+#define ARENA_ROUND_UP(x) (((x) + ARENA_ALIGN - 1) & ~(ARENA_ALIGN - 1))
+
+
 /* function prototypes */
 
 extern void arenaInit (ARENA * a, size_t blksize, size_t maxsize,

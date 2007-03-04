@@ -12,7 +12,7 @@
 
 unsigned long numIdents = 0; /* Debug */
 
-static IDENT_TABLE * allIdents = NULL;
+IDENT_TABLE * allIdents = NULL;
 
 /*
  * Strcmp() is defined here to avoid any dynamic linking overhead

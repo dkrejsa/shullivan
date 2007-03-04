@@ -73,6 +73,39 @@ struct _SCANNER {
 	unsigned int lineno;
 };
 
+typedef enum _HTYPE {
+	HT_IMPORT,
+	HT_EXPORT,
+	HT_THM,
+	HT_DEF,
+	HT_VAROLDKIND,	/* Record a variable's old kind. Must be immediately
+			   followed by HT_VARNEWKIND. */
+	HT_VARNEWKIND,	/* Record a variable's old kind. Must be immediately
+			   followed by HT_VAR. */
+	HT_VAR,		/* Add a variable */
+	HT_KINDBIND0,	/* records old kind for immeiately following 
+			   kindbind */
+	HT_KINDBIND	/* a .gh-style kindbind */
+} HTYPE;
+
+typedef struct _HISTORY_ITEM {
+	HTYPE htype;
+	void * it;
+} HISTORY_ITEM;
+
+/*
+ * The shullivan history is a two-level array of HISTORY_ITEMs.
+ * Each entry in the top level array is a pointer to  a 'chunk'
+ * of 1024 history items.
+ */
+
+#define HISTORY_CHUNK_SIZE	1024
+typedef struct _HISTORY_CHUNK {
+	HISTORY_ITEM h [HISTORY_CHUNK_SIZE];
+} HISTORY_CHUNK;
+
+#define HISTORY_TOP_LEVEL_SIZE	16384
+
 typedef struct _DVWORK {
 	int i;
 	IDENT * id;
@@ -115,6 +148,11 @@ typedef struct _SHULLIVAN {
 					   default ':' */
 	char ** path;			/* array of directories for imports */
 	int ndirs;			/* number of dirs in the search path */
+	HISTORY_CHUNK ** history;
+	unsigned long histlen;
+	unsigned long histmax;		/* size of top level array */
+
+	int saveProof;			/* if not 0, save proof info */
 
 	int verbose;			/* verbosity level */
 	unsigned long flags;
@@ -134,6 +172,7 @@ static void * dvEnumerate (int nvars, uint32_t * dvbits,
 static void sexpr_print (FILE * f, ITEM * item);
 static void exprPrint (FILE * f, EXPR * exp);
 static int port (SHULLIVAN * shul, ITEM * args, int importing);
+static void ifaceFree (SHULLIVAN * shul, INTERFACE * iface);
 
 static char * shulPrompt = "shul=> ";
 static char * shulContinuePrompt = "> ";
@@ -196,6 +235,55 @@ growBufInit (GROWBUF * gb, size_t n)
 		return -1;
 
 	gb->size = n;
+	return 0;
+}
+
+static int
+histAdd (SHULLIVAN * shul, HTYPE htype, void * it)
+{
+	unsigned long len = shul->histlen;
+	unsigned long topi = len / HISTORY_CHUNK_SIZE;
+	HISTORY_CHUNK * chunk;
+
+	len = len % HISTORY_CHUNK_SIZE;
+
+	if (topi >= shul->histmax) {
+		HISTORY_CHUNK ** ppChunk;
+
+		assert (topi == shul->histmax && len == 0);
+
+		/* Add top-level space for a 1024*1024 more items */
+		fprintf (stderr, "Growing top-level history from "
+			 "%lu to %lu\n",
+			 shul->histlen, shul->histlen + 1024);
+		ppChunk = realloc (shul->history,
+				   ((shul->histmax + 1024) * 
+				    sizeof (*shul->history)));
+		if (ppChunk == NULL) {
+			perror ("histAdd:realloc");
+			return -1;
+		}
+		memset (shul->history + shul->histmax, 0,
+			1024 * sizeof (*shul->history));
+		shul->history = ppChunk;
+		shul->histmax += 1024;
+	}
+
+	chunk = shul->history[topi];
+	if (chunk == NULL) {
+		assert (len == 0);
+		chunk = malloc (sizeof (*chunk));
+		if (chunk == NULL) {
+			perror ("histAdd:malloc");
+			return -1;
+		}
+		shul->history[topi] = chunk;
+	}
+
+	chunk->h[len].htype = htype;
+	chunk->h[len].it = it;
+	shul->histlen++;
+
 	return 0;
 }
 
@@ -1154,20 +1242,30 @@ printHelp (void)
 "       cd DIRECTORY\n"
 "def            - ghilbert definition\n"
 "       def ((DEFID [VAR ...]) RHS)\n"
+"defs           - list definitions\n"
+"erase          - erase history item NUMBER and all subsequent items\n"
+"       erase NUMBER\n"
 "export         - verify an export .ghi Ghilbert interface file\n"
 "       export (IFACEID path/to/basename ([PARAM_ID...]) \"PREFIX\")\n"
 "flags        - set flags affecting shullivan operation\n"
 "       flags NUMERIC_VALUE\n"
+"history      - display history\n"
 "import         - import a .ghi Ghilbert interface file\n"
 "       import (IFACEID path/to/basename ([PARAM_ID...]) \"PREFIX\")\n"
 "interfaces     - list imported interfaces\n"
+"keep           - Toggle retention of proof steps.\n"
+"kindbind       - kindbind with .gh file semantics\n"
+"       kindbind (OLDKIND NEWKIND)\n"
 "kinds          - list all kinds\n"
 "load           - load a .gh Ghilbert proof file\n"
 "       load path/to/basename\n"
+"save           - save results to a file\n"
+"       save (FILENAME [START_HISTNUM])\n"
 "stats          - print various statistics\n"
 "thm            - verify theorem\n"
 "       thm (THMID ([(DVVAR1 ...) ...]) ([(HYPNAM HYP) ...])\n"
 "                  {CONCL | ([CONCL ...])} (STEP ...))\n"
+"undo           - undo last change (last history item)\n"
 "var            - define variables\n"
 "       var (KINDID VAR1 ...)\n"
 "variables      - list variables\n"
@@ -1422,14 +1520,15 @@ exprPrint (FILE * f, EXPR * exp)
 typedef struct _STATDVPRINT {
 	STATEMENT * s;
 	char ** space;
+	FILE * f;
 } STATDVPRINT;
 
 void * dvPairPrint (int i, int j, void * ctx)
 {
 	STATDVPRINT * sp = ctx;
 
-	printf ("%s(%s %s)", *sp->space,
-		sp->s->vi[i].id->name, sp->s->vi[j].id->name);
+	fprintf (sp->f, "%s(%s %s)", *sp->space,
+		 sp->s->vi[i].id->name, sp->s->vi[j].id->name);
 	*sp->space = " ";
 
 	return NULL;
@@ -1484,8 +1583,11 @@ dvEnumerate (int nvars, uint32_t * dvbits, DV_ENUMERATE_FUNC f, void * ctx)
 	return NULL;
 }
 
+#define PRINT_AS_THM	2
+#define ABBREV_PROOF	4
+
 static void
-statementPrint (STATEMENT * s, int verbose)
+statementPrint (FILE * f, STATEMENT * s, int verbose)
 {
 	int indent;
 	char * space;
@@ -1493,56 +1595,92 @@ statementPrint (STATEMENT * s, int verbose)
 	STATDVPRINT sp;
 
 	if (verbose == 0) {
-		printf (" %s", s->sym.ident->name);
+		fprintf (f, " %s", s->sym.ident->name);
 		return;
 	}
-	indent = strlen (s->sym.ident->name) + 7;
 
-	printf ("stmt (%s (", s->sym.ident->name);
+	indent = (verbose >> 16);
+	verbose &= 0xffff;
+
+	if ((verbose & PRINT_AS_THM) != 0 && s->thm != NULL)
+		fprintf (f, "%*sthm  (%s (", indent, "", s->sym.ident->name);
+	else
+		fprintf (f, "%*sstmt (%s (", indent, "", s->sym.ident->name);
+	indent += strlen (s->sym.ident->name) + 7;
+
 	if (s->dvbits != NULL) {
 		space = "";
 		sp.space = &space;
 		sp.s = s;
+		sp.f = f;
 		dvEnumerate (s->nhvars + s->nMand, s->dvbits,
 			     dvPairPrint, &sp);
-		printf (")\n%*s(", indent, "");
+		fprintf (f, ")\n%*s(", indent, "");
 	} else {
-		printf (") (");
+		fprintf (f, ") (");
 	}
 
 	space = "";
 	for (i = 0; i < s->nHyps; ++i) {
-		printf ("%s", space);
+		fprintf (f, "%s", space);
 		space = " ";
-		exprPrint (stdout, s->hyps[i]);
+		if (verbose > 1 && s->thm != NULL) {
+			fprintf (f, "(%s ", s->thm->hypnam[i]->name);
+			exprPrint (f, s->hyps[i]);
+			fprintf (f, ")");
+		} else
+			exprPrint (f, s->hyps[i]);
 	}
 	if (i != 0)
-		printf (")\n%*s", indent, "");
+		fprintf (f, ")\n%*s", indent, "");
 	else
-		printf (") ");
+		fprintf (f, ") ");
 	if (s->nCons != 1) {
-		printf ("(");
+		fprintf (f, "(");
 	}
 
 	space = "";
 	for (i = 0; i < s->nCons; ++i) {
-		printf ("%s", space);
+		fprintf (f, "%s", space);
 		space = " ";
-		exprPrint (stdout, s->cons[i]);
+		exprPrint (f, s->cons[i]);
 	}
 	if (s->nCons != 1) {
-		printf (")");
+		fprintf (f, ")");
 	}
-	printf (")\n");
+	if ((verbose & ABBREV_PROOF) != 0) {
+		fprintf (f, " ...");
+	} else if ((verbose & PRINT_AS_THM) != 0 && s->thm != NULL) {
+		THEOREM * t = s->thm;
+		PROOF_STEP * s;
+		fprintf (f, "\n%*s(", indent, "");
+		space = "";
+		for (i = 0; i < t->nSteps; ++i) {
+			fprintf (f, "%s", space);
+			space = " ";
+			s = &t->steps[i];
+			if (s->s.type == STEPT_EXPR)
+				exprPrint (f, s->expr.x);
+			else if (s->s.type == STEPT_REF)
+				fprintf (f, "%s",
+					 s->ref.stat->sym.ident->name);
+			else if (s->s.type == STEPT_HYP)
+				fprintf (f, "%s",
+					 t->hypnam[s->hyp.index]->name);
+		}
+		fprintf (f, ")");
+	}
+	fprintf (f, ")\n");
 }
 
 static void *
-statementPrintMe (void * shul, MAP_ELEM * me)
+statementPrintMe (void * ctx, MAP_ELEM * me)
 {
+	INTERFACE * iface = ctx;
 	STATEMENT * stat = me->v.p;
 
-	if (stat->sym.stype == ST_STMT)
-		statementPrint (stat, 1);
+	if (stat->sym.stype == ST_STMT && stat->iface == iface)
+		statementPrint (stdout, stat, 1 | (2 << 16));
 
 	return NULL;
 }
@@ -1550,7 +1688,23 @@ statementPrintMe (void * shul, MAP_ELEM * me)
 static int
 statementList (SHULLIVAN * shul, ITEM * ignored)
 {
-	mappingEnumerate (shul->syms, statementPrintMe, shul);
+	unsigned long i;
+	HISTORY_ITEM * hi;
+	INTERFACE * iface;
+
+	for (i = 0; i < shul->histlen; ++i) {
+		hi = &shul->history[i / HISTORY_CHUNK_SIZE]->
+			h[i % HISTORY_CHUNK_SIZE];
+		if (hi->htype == HT_THM)
+			statementPrint (stdout, (STATEMENT *)hi->it, 1);
+		else if (hi->htype == HT_IMPORT) {
+			iface = hi->it;
+			printf ("From %s :\n",
+				iface->sym.ident->name);
+			mappingEnumerate (shul->syms,
+					  statementPrintMe, iface);
+		}
+	}
 	return 0;
 }
 
@@ -1565,6 +1719,7 @@ typedef struct _IMPORT_CONTEXT {
 	int importing;		/* 1 -> import, 0 -> export */
 	int exportFail;		/* Indicates export failure (e.g. on missing
 				   statement) but can continue the export */
+	int keephist;		/* keep history */
 } IMPORT_CONTEXT;
 
 typedef int (*IMPORT_CMD_FUNC) (SHULLIVAN * shul, 
@@ -2442,7 +2597,15 @@ static void
 statementFree (STATEMENT * stat)
 {
 	int i;
+	THEOREM * thm;
+
 	assert (stat != NULL && stat->sym.ident != NULL);
+	if ((thm = stat->thm) != NULL) {
+		for (i = 0; i < stat->nHyps; ++i)
+			identFree (thm->hypnam[i]);
+		free (thm->steps);
+		free (thm);
+	}
 	identFree (stat->sym.ident);
 	i = stat->nhvars + stat->nMand;
 	while (i > 0) {
@@ -2927,6 +3090,7 @@ import_var (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ctx)
 	ITEM * kindItem;
 	ITEM * varItem;
 	KIND * kind;
+	KIND * oldkind;
 	VAR * var;
 	IDENT * id;
 	MAP_ELEM * me;
@@ -2985,14 +3149,35 @@ import_var_format:
 				return -1;
 			}
 			var = SYM2VAR(me->v.p);
+			oldkind = var->ex.kind;
 			var->ex.kind = kind; /* change kind */
 		} else {
+			oldkind = NULL;
 			me->v.p = &var->sym;
 			id->refcount ++;
+		}
+		if (ctx->keephist) {
+			if (histAdd (shul, HT_VAROLDKIND,  oldkind) != 0)
+				goto import_var_bad1;
+			if (histAdd (shul, HT_VARNEWKIND, kind) != 0) {
+				shul->histlen --;
+				goto import_var_bad1;
+			}
+			if (histAdd (shul, HT_VAR, var) != 0) {
+				shul->histlen -= 2;
+				goto import_var_bad1;
+			}
 		}
 	}
 
 	return 0;
+
+import_var_bad1:
+	if (oldkind == NULL) {
+		id->refcount--;
+		varFree (var);
+	}
+	return -1;
 }
 
 static int
@@ -3724,16 +3909,11 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 	ITEM * param;
 	IDENT * id;
 	MAP_ELEM * me;
-	MAP_ELEM * nextme;
 	int nparams;
 	int ret;
 	INTERFACE * iface;
 	INTERFACE * paramIf;
 	INTERFACE ** paramIfaces;
-	SYMBOL * sym;
-	TERM * term;
-	KIND * kind;
-	MAPPING * origKinds = NULL; /* avoid gcc warning */
 	IMPORT_CONTEXT ctx;
 	char * pfxsrc;
 	int pfxlen;
@@ -3765,30 +3945,37 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 		return -1;
 	}
 
+	ctx.localTerms = NULL;  /* prevent premature cleanup */
+	ctx.localSyms = NULL;
+	ctx.localKinds = NULL;
+
+	iface->fileId = fileItem->id.id;
+	iface->fileId->refcount++;
+
 	me = mapElemInsert (nameItem->id.id, shul->interfaces);
 	if (me == NULL) {
 		perror ("port:mapElemInsert");
-		goto port_bad1;
+		goto port_bad;
 	}
+
 	if (me->v.p != NULL) {
 		fprintf (stderr,
 			 "*** Interface named %s already present.\n",
 			nameItem->id.id->name);
-		goto port_bad1;
+		goto port_bad;
 	}
 	me->v.p = iface;
-	nameItem->id.id->refcount++;
 
-	iface->sym.stype = ST_INTERFACE;
+	nameItem->id.id->refcount++;
 	iface->sym.ident = nameItem->id.id;
-	iface->import = importing;
+	iface->sym.stype = ST_INTERFACE;
 
 	/*
 	 * Kinds provided by this interface. Lookup by local (unprefixed)
 	 * identifiers.
 	 */
 	if ((iface->kinds = mappingCreate(NULL)) == NULL)
-		goto port_bad2;
+		goto port_bad;
 
 	/*
 	 * Terms provided by this interface.
@@ -3797,7 +3984,7 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 	 * are removed at the end of the import/export.
 	 */
 	if ((iface->terms = mappingCreate(NULL)) == NULL)
-		goto port_bad3;
+		goto port_bad;
 
 	ctx.iface = iface;
 	/*
@@ -3805,24 +3992,25 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 	 * obtained from 'param'.
 	 */
 	if ((ctx.localKinds = mappingCreate(NULL)) == NULL)
-		goto port_bad4;
+		goto port_bad;
 
 	/*
 	 * Variables exported by this interface.
 	 */
 	if ((ctx.localSyms = mappingCreate(NULL)) == NULL)
-		goto port_bad5;
+		goto port_bad;
 
 	/*
 	 * All terms used by this interface, including those obtained
 	 * from 'param'.
 	 */
 	if ((ctx.localTerms = mappingCreate(NULL)) == NULL)
-		goto port_bad6;
+		goto port_bad;
 
 	ctx.paramIndex = 0;
 	ctx.importing = importing;
 	ctx.exportFail = 0;
+	ctx.keephist = 0;
 
 	param = paramsItem->sl.first;
 	nparams = 0;
@@ -3833,7 +4021,7 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 				 "*** Each interface parameter must be "
 				 "an identifier naming an already "
 				 "imported/exported interface.\n");
-			goto port_bad6;
+			goto port_bad;
 		}
 		++nparams;
 		param = param->it.next;
@@ -3842,7 +4030,7 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 	paramIfaces = malloc (nparams * sizeof (*paramIfaces));
 	if (paramIfaces == NULL) {
 		perror ("malloc");
-		goto port_bad6;
+		goto port_bad;
 	}
 
 	iface->nparams = nparams;
@@ -3856,7 +4044,7 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 			fprintf (stderr, 
 				 "Parameter interface '%s' "
 				 "not found.\n", param->id.id->name);
-			goto port_bad7;
+			goto port_bad;
 		}
 		assert (paramIf->sym.stype == ST_INTERFACE);
 
@@ -3894,7 +4082,7 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 	else {
 		iface->prefix = malloc (pfxlen + 1);
 		if (iface->prefix == NULL)
-			goto port_bad7;
+			goto port_bad;
 		memcpy (iface->prefix, pfxsrc, pfxlen);
 		iface->prefix[pfxlen] = '\0';
 	}
@@ -3908,14 +4096,16 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 		 * need in that case.
 		 */
 
-		origKinds = mappingCreate (NULL);
-		if (origKinds == NULL)
-			goto port_bad7;
+		iface->origKinds = mappingCreate (NULL);
+		if (iface->origKinds == NULL)
+			goto port_bad;
 
 		if (mappingEnumerate (shul->kinds, recordOrigKindRep,
-				      origKinds) != NULL)
-			goto port_bad8;
+				      iface->origKinds) != NULL)
+			goto port_bad;
 	}
+
+	iface->import = importing;
 
 	/* The main work */
 
@@ -3932,27 +4122,51 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 		ret = -1;
 	}
 
-	if (ret == 0) {
+	if (ret == 0 && histAdd (shul, 
+				 importing ? HT_IMPORT : HT_EXPORT,
+				 iface) == 0) {
 		mappingDelete (ctx.localSyms, localVarFree, NULL);
 		identTableDelete (ctx.localTerms);
 		identTableDelete (ctx.localKinds);
 
-		if (importing) {
-			mappingDelete (origKinds, NULL, NULL);
-		} else if (ctx.exportFail)
+		if (!importing && ctx.exportFail)
 			ret = -1; /* XXX but keep interface */
 
 		return ret;
 	}
 
-	/* Failure. Clean up global changes in import case. */
+port_bad:
 
-	if (importing) {
-		/* 
-		 * Here we rely upon the fact that since we just 
-		 * attempted unsuccessfully to add the interface,
-		 * no other theorems/terms/etc. depending upon
-		 * this interface can yet have been added.
+	if (ctx.localTerms != NULL)
+		identTableDelete (ctx.localTerms);
+
+	if (ctx.localSyms != NULL)
+		mappingDelete (ctx.localSyms, localVarFree, NULL);
+
+	if (ctx.localKinds != NULL)
+		identTableDelete (ctx.localKinds);
+
+	ifaceFree (shul, iface);
+	return -1;
+
+}
+
+static void
+ifaceFree (SHULLIVAN * shul, INTERFACE * iface)
+{
+	MAP_ELEM * me;
+	MAP_ELEM * nextme;
+	IDENT * id;
+	SYMBOL * sym;
+	TERM * term;
+	KIND * kind;
+
+	if (iface->import) {
+		/*
+		 * Free any statements, terms, and kinds
+		 * which came from the interface. It is assumed
+		 * that any later work which depended upon these has
+		 * been freed first.
 		 */
 
 		MAP_ELEM_ITER_SAFE (shul->syms, me, nextme) {
@@ -3961,9 +4175,8 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 			if (sym->stype == ST_STMT &&
 			    ((STATEMENT *)sym)->iface == iface) {
 				id = me->obj;
-				statementFree ((STATEMENT *)sym);
 				(void)mapElemDelete (me->obj, shul->syms);
-				(void)identFree (id);
+				statementFree ((STATEMENT *)sym);
 			}
 		}
 
@@ -3989,92 +4202,88 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 				(void)identFree (id);
 			}
 		}
-
-		/* back out kindbinds */
-		mappingEnumerate (origKinds, restoreOrigKindRep, NULL);
 	}
 
-port_bad8:
-	if (importing)	
-		mappingDelete (origKinds, NULL, NULL);
-
-port_bad7:
+	if (iface->origKinds) {
+		mappingEnumerate (iface->origKinds, restoreOrigKindRep, NULL);
+		mappingDelete (iface->origKinds, NULL, NULL);
+	}
 	free (iface->prefix); /* OK for NULL */
 	free (iface->params);
-port_bad6:
-	if (ctx.localTerms != NULL)
-		identTableDelete (ctx.localTerms);
-
-	mappingDelete (ctx.localSyms, localVarFree, NULL);
-port_bad5:
-	identTableDelete (ctx.localKinds);
-port_bad4:
-	identTableDelete (iface->terms);
-port_bad3:
-	identTableDelete (iface->kinds);
-port_bad2:
-	mapElemDelete (iface->sym.ident, shul->interfaces);
-	(void)identFree (iface->sym.ident);
-port_bad1:
+	if (iface->terms)
+		identTableDelete (iface->terms);
+	if (iface->kinds)
+		identTableDelete (iface->kinds);
+	if (iface->sym.ident) {
+		(void)mapElemDelete (iface->sym.ident, shul->interfaces);
+		(void)identFree (iface->sym.ident);
+	}
+	identFree (iface->fileId);
 	free (iface);
-	return -1;
-
 }
 
+typedef struct _STMT_FOR_IFACE_CTX {
+	INTERFACE * iface;
+	FILE * f;
+} STMT_FOR_IFACE_CTX;
+
 static void *
-stmtForIface (void * iface, MAP_ELEM * me)
+stmtForIface (void * ctx, MAP_ELEM * me)
 {
+	STMT_FOR_IFACE_CTX * c = ctx;
 	STATEMENT * stmt = me->v.p;
 
 	assert (stmt != NULL);
 
-	if (stmt->iface == (INTERFACE *)iface)
-		statementPrint (stmt, 0);
+	if (stmt->iface == c->iface)
+		statementPrint (c->f, stmt, 0);
 
 	return NULL;
 }
 
-static void *
-ifacePrint (void * shul0, MAP_ELEM * me)
+static void
+ifacePrint (FILE * f, SHULLIVAN * shul, INTERFACE * iface, int verbose)
 {
-	INTERFACE * iface;
 	INTERFACE * param;
-	SHULLIVAN * shul = (SHULLIVAN *) shul0;
-	IDENT * id = me->obj;
 	int i;
-
-	iface = me->v.p;
 
 	assert (iface != NULL);
 
-	if (!iface->import)
-		printf ("[export] ");
-
-	printf ("%s : prefix=\"%s\" params=(", id->name,
-		iface->prefix == NULL ? "" : iface->prefix);
+	fprintf (f, "%s (%s %s (", 
+		 iface->import ? "import" : "export",
+		 iface->sym.ident->name,
+		 iface->fileId->name);
 
 	for (i = 0; i < iface->nparams; ++i) {
 		param = iface->params[i];
-		printf (" %s", param->sym.ident->name);
+		fprintf (f, " %s", param->sym.ident->name);
 	}
 
-	printf (" )\n   Kinds: ");
+	fprintf (f, " ) \"%s\")\n", iface->prefix ? iface->prefix : "");
 
-	(void)mappingEnumerate (iface->kinds, idPrint, stdout);
+	if (verbose == 0)
+		return;
 
-	printf ("\n   Terms: ");
+	fprintf (f, "   Kinds: ");
 
-	(void)mappingEnumerate (iface->terms, idPrint, stdout);
+	(void)mappingEnumerate (iface->kinds, idPrint, f);
+
+	fprintf (f, "\n   Terms: ");
+
+	(void)mappingEnumerate (iface->terms, idPrint, f);
 
 	if (iface->import) {
-		printf ("\n   Statements: ");
+		STMT_FOR_IFACE_CTX c;
 
-		(void)mappingEnumerate (shul->syms, stmtForIface, iface);
+		c.iface = iface;
+		c.f = f;
+
+		fprintf (f, "\n   Statements: ");
+
+		(void)mappingEnumerate (shul->syms, stmtForIface, &c);
 	}
 
 	printf ("\n");
-
-	return NULL;
 }
 
 static void *
@@ -4161,7 +4370,31 @@ kindsRaw (SHULLIVAN * shul, ITEM * ignored)
 static int
 interfaceList (SHULLIVAN * shul, ITEM * ignored)
 {
-	(void)mappingEnumerate (shul->interfaces, ifacePrint, shul);
+	unsigned long i;
+	HISTORY_ITEM * hi;
+
+	for (i = 0; i < shul->histlen; ++i) {
+		hi = &shul->history[i / HISTORY_CHUNK_SIZE]->
+			h[i % HISTORY_CHUNK_SIZE];
+		if (hi->htype == HT_IMPORT || hi->htype == HT_EXPORT)
+			ifacePrint (stdout, shul, hi->it, 1);
+	}
+	return 0;
+}
+
+static void *
+idNamePrint (void * ctx, MAP_ELEM * me)
+{
+	FILE * f = ctx;
+	fprintf (f, " %s", (char *)me->obj);
+	return NULL;
+}
+
+static int
+identifierList (SHULLIVAN * shul, ITEM * ignored)
+{
+	(void)mappingEnumerate (allIdents, idNamePrint, stdout);
+	printf ("\n");
 	return 0;
 }
 
@@ -4186,33 +4419,41 @@ termList (SHULLIVAN * shul, ITEM * ignored)
 	return 0;
 }
 
+
+static void
+defPrint (FILE * f, DEF * def)
+{
+	int i;
+
+	fprintf (f, "def ((%s", def->t.sym.ident->name);
+
+	for (i = 0; i < def->t.arity; ++i) {
+		fprintf (f, " %s", def->vi[i].id->name);
+	}
+
+	fprintf (f, ") ");
+
+	exprPrint (f, def->expr);
+
+	fprintf (f, ")\n");
+}
+
 static void *
-defPrint (void * ctx, MAP_ELEM * me)
+defPrintMe (void * ctx, MAP_ELEM * me)
 {
 	DEF * def = me->v.p;
-	int i;
 
 	if (def->t.sym.stype != ST_DEF)
 		return NULL;
 
-	printf ("def ((%s", def->t.sym.ident->name);
-
-	for (i = 0; i < def->t.arity; ++i) {
-		printf (" %s", def->vi[i].id->name);
-	}
-
-	printf (") ");
-
-	exprPrint (stdout, def->expr);
-
-	printf (")\n");
+	defPrint (stdout, def);
 	return NULL;
 }
 
 static int
 defList (SHULLIVAN * shul, ITEM * ignored)
 {
-	(void)mappingEnumerate (shul->terms, defPrint, shul);
+	(void)mappingEnumerate (shul->terms, defPrintMe, shul);
 	return 0;
 }
 
@@ -4257,7 +4498,13 @@ varList (SHULLIVAN * shul, ITEM * ignored)
 static int
 stats (SHULLIVAN * shul, ITEM * ignored)
 {
-	printf ("numIdents = %lu\n", numIdents);
+	printf ("%lu history items\n", shul->histlen);
+	printf ("%u symbols (stmt or var)\n", shul->syms->size);
+	printf ("%u terms\n", shul->terms->size);
+	printf ("%u kinds\n", shul->kinds->size);
+	printf ("%u interfaces\n", shul->interfaces->size);
+	printf ("%lu identifiers\n", numIdents);
+	printf ("%lu mappings in use\n", mappings);
 	printf ("MAP_ELEMs: total %lu, in use %lu, free %lu\n",
 		numMapElems, numMapElems - freeMapElems, freeMapElems);
 	printf ("VARs: total %lu, in use %lu, free %lu\n",
@@ -4325,6 +4572,254 @@ flags (SHULLIVAN * shul, ITEM * sexpr)
 			"exported statements [%s]\n", EXPORT_WARN_DV,
 			(flg & EXPORT_WARN_DV) ? "On" : "Off");
 	}
+	return 0;
+}
+
+static int
+histPrint (FILE * f, SHULLIVAN * shul, 
+	   unsigned long start, unsigned long stop, int verbose)
+{
+	unsigned long i;
+	HISTORY_ITEM * hi;
+	VAR * var;
+	KIND * kind = NULL;
+	KIND * varkind = NULL;
+	STATEMENT * stat;
+
+	assert (shul != NULL && 
+		start <= shul->histlen && stop <= shul->histlen);
+
+	for (i = start; i < stop; ++i) {
+		hi = &shul->history[i / HISTORY_CHUNK_SIZE]->
+			h[i % HISTORY_CHUNK_SIZE];
+		if (verbose)
+			fprintf (f, "%lu. ", i);
+		switch (hi->htype) {
+		case HT_THM:
+			stat = hi->it;
+			if (!verbose && stat->thm == NULL)
+				continue;
+			statementPrint (f, hi->it, 
+					verbose ? (PRINT_AS_THM | 
+						   ABBREV_PROOF) :
+					PRINT_AS_THM);
+			break;
+		case HT_IMPORT:
+		case HT_EXPORT:
+			ifacePrint (f, shul, hi->it, 0);
+			break;
+		case HT_VAROLDKIND:
+			if (verbose && hi->it != NULL)
+				fprintf (f, 
+					 "# The following var used to be of "
+					 "kind %s\n",
+					 ((KIND *)hi->it)->id->name);
+			if (verbose && hi->it == NULL)
+				fprintf (f, "# The following var is new.\n");
+			break;
+		case HT_VARNEWKIND:
+			assert (varkind == NULL);
+			varkind = hi->it;
+			if (verbose)
+				fprintf (f, 
+					 "# The following var is now of "
+					 "kind %s\n", varkind->id->name);
+			break;
+		case HT_VAR:
+			var = hi->it;
+			assert (varkind != NULL);
+			fprintf (f, "var (%s %s)\n",
+				 varkind->id->name,
+				 var->sym.ident->name);
+			varkind = NULL;
+			break;
+		case HT_DEF:
+			defPrint (f, hi->it);
+			break;
+		case HT_KINDBIND0:
+			assert (kind == NULL);
+			kind = hi->it;
+			if (verbose)
+				fprintf (f, "# old kind %s\n", kind->id->name);
+			break;
+		case HT_KINDBIND:
+			assert (kind != NULL);
+			fprintf (f, "kindbind (%s %s)\n", kind->id->name,
+				 ((KIND *)hi->it)->id->name);
+			kind = NULL;
+			break;
+		}
+	}
+	return 0;
+}
+
+static int
+history (SHULLIVAN * shul, ITEM * ignored)
+{
+	return histPrint (stdout, shul, 0, shul->histlen, 1);
+}
+
+static int
+save (SHULLIVAN * shul, ITEM * item) {
+	ITEM * fileItem;
+	ITEM * numItem;
+	unsigned long start = 0;
+	char * end;
+	FILE * f;
+	int ret;
+	int ret2;
+
+	if (item->it.itype != IT_SLIST || 
+	    (fileItem = item->sl.first) == NULL ||
+	    fileItem->it.itype != IT_IDENT) {
+saveSyntax:
+		fprintf (stderr,
+			 "*** Expected 'save (FILENAME [START_HISTNUM])'\n");
+		return -1;
+	}
+	if ((numItem = fileItem->it.next) != NULL) {
+		if (numItem->it.itype != IT_IDENT)
+			goto saveSyntax;
+		start = strtoul (numItem->id.id->name, &end, 0);
+		if (end == numItem->id.id->name)
+			goto saveSyntax;
+
+		if (start >= shul->histlen) {
+			fprintf (stderr,
+				 "*** There are only %lu history items.\n",
+				 shul->histlen);
+			return -1;
+		}
+	}
+
+	f = fopen (fileItem->id.id->name, "w");
+	if (f == NULL) {
+		perror ("fopen");
+		fprintf (stderr, "*** Cannot open '%s' for writing.\n",
+			 fileItem->id.id->name);
+		return -1;
+	}
+	ret = histPrint (f, shul, start, shul->histlen, 0);
+	ret2 = fclose (f);
+	if (ret != 0)
+		perror ("fclose");
+	return ret == 0 ? ret2 : ret;
+}
+
+static int
+undoLast (SHULLIVAN * shul)
+{
+	HISTORY_ITEM * hi;
+	unsigned long i;
+	VAR * var;
+	KIND * kind;
+	DEF * def;
+	SYMBOL * sym;
+	int j;
+
+	i = shul->histlen;
+	if (i == 0)
+		return -1;
+
+	--i;
+	hi = &shul->history[i / HISTORY_CHUNK_SIZE]->
+		h[i % HISTORY_CHUNK_SIZE];
+	switch (hi->htype) {
+	case HT_VAR:
+		assert (i >= 2 && hi[-1].htype == HT_VARNEWKIND &&
+			hi[-2].htype == HT_VAROLDKIND);
+		var = hi->it;
+		kind = hi[-2].it;
+		if (kind != NULL)
+			var->ex.kind = kind;
+		else {
+			mapElemDelete (var->sym.ident, shul->syms);
+			identFree (var->sym.ident);
+			varFree (var);
+		}
+		shul->histlen -= 3;
+		break;
+
+	case HT_IMPORT:
+	case HT_EXPORT:
+		ifaceFree (shul, hi->it); /* also removes ident from
+					     shul->interfaces and frees it */
+		shul->histlen --;
+		break;
+
+	case HT_THM:
+		sym = hi->it;
+		assert (sym->stype == ST_STMT);
+		mapElemDelete (sym->ident, shul->syms);
+		statementFree ((STATEMENT *)sym); /* also frees sym->ident */
+		shul->histlen --;
+		break;
+
+	case HT_KINDBIND:
+		assert (i >= 1 && hi[-1].htype == HT_KINDBIND0);
+		kind = hi->it;
+		mapElemDelete (kind->id, shul->kinds);
+		identFree (kind->id);
+		free (kind);
+		shul->histlen -= 2;
+		break;
+
+	case HT_DEF:
+		def = hi->it;
+		mapElemDelete (def->t.sym.ident, shul->terms);
+		identFree (def->t.sym.ident);
+		for (j = 0; j < def->t.arity + def->ndummies; ++j)
+			identFree (def->vi[j].id);
+		free (def);
+		shul->histlen --;
+		break;
+
+	case HT_KINDBIND0:
+	case HT_VAROLDKIND:
+	case HT_VARNEWKIND:
+	default:
+		assert (0);
+	}
+	return 0;
+}
+
+static int
+undo (SHULLIVAN * shul, ITEM * unused)
+{
+	int ret = undoLast (shul);
+	if (ret != 0)
+		fprintf (stderr, "*** No history items left.");
+	return ret;
+}
+
+static int
+erase (SHULLIVAN * shul, ITEM * item)
+{
+	unsigned long i;
+	char * end;
+
+	if (item->it.itype != IT_IDENT) {
+eraseSyntax:
+		fprintf (stderr, "*** Expected 'erase HISTORY_ITEM_NUMBER'\n");
+		if (shul->histlen != 0)
+			fprintf (stderr, "History item numbers : 0 <= n < %lu",
+				 shul->histlen);
+		else
+			fprintf (stderr, "There are no history items.\n");
+		return -1;
+	}
+	i = strtoul (item->id.id->name, &end, 0);
+	if (end == item->id.id->name)
+		goto eraseSyntax;
+	if (i >= shul->histlen)
+		goto eraseSyntax;
+
+	/* Note, undoLast() may erase a bit past i if HT_VAR* or HT_KINDBIND*
+	 * items are involved.
+	 */
+	while (shul->histlen > i)
+		undoLast (shul);
+
 	return 0;
 }
 
@@ -4635,6 +5130,124 @@ proofNbhdPrint (ITEM * stepItem, int step, int nSteps)
 	fprintf (stderr, "\n");
 }
 
+static size_t
+exprSize (EXPR * exp)
+{
+	size_t size;
+	int i;
+	if (exp->ex.etype == ET_SEXPR) {
+		size = (offsetof (S_EXPR, args) + 
+			exp->sx.t->arity * sizeof (EXPR *));
+
+		size = ARENA_ROUND_UP (size);
+
+		for (i = 0; i < exp->sx.t->arity; ++i)
+			size += exprSize (exp->sx.args[i]);
+		return size;
+	}
+
+	return 0; /* variable space is accounted for elsewhere */
+}
+
+static EXPR *
+exprCopy (EXPR * exp, char ** ppMem, EXPR_VARINFO * vi, int nvars)
+{
+	int i;
+	S_EXPR * sx;
+	size_t size;
+
+	if (exp->ex.etype == ET_SEXPR) {
+		sx = (S_EXPR *) *ppMem;
+		sx->ex = exp->sx.ex;
+		sx->t = exp->sx.t;
+
+		size = (offsetof (S_EXPR, args) + 
+			exp->sx.t->arity * sizeof (EXPR *));
+
+		size = ARENA_ROUND_UP (size);
+
+		*ppMem += size;
+
+		for (i = 0; i < exp->sx.t->arity; ++i)
+			sx->args[i] = exprCopy (exp->sx.args[i], ppMem,
+						vi, nvars);
+		return (EXPR *)sx;
+	}
+
+	assert (exp->ex.etype == ET_IVAR);
+
+	/* 
+	 * Variables in the hypotheses or conclusions don't change
+	 * location.
+	 */
+
+	if (exp->vi.index < nvars)
+		return exp;
+
+	/* Other variables occurring in the proof steps have moved. */
+	return (EXPR *)(vi + (exp->vi.index - nvars));
+}
+
+
+static int
+proofHold (THEOREM * thm, int allvars, VMAP * vmap, SHULLIVAN * shul)
+{
+	int i;
+	PROOF_STEP * s;
+	size_t size = sizeof (PROOF_STEP) * thm->nSteps;
+	char * pMem;
+	EXPR_VARINFO * vi;
+	int nvars;
+
+	for (i = 0; i < thm->nSteps; ++i) {
+		s = &thm->steps[i];
+		/* STEPT_HYP and STEPT_REF take up no additional space */
+		if (s->s.type == STEPT_EXPR)
+			size += exprSize (s->expr.x);
+	}
+
+	/*
+	 * Space for the variables occurring in the proof steps but
+	 * not in the hypotheses or conclusions.
+	 */
+
+	nvars = thm->stmt->nMand + thm->stmt->nhvars;
+
+	size += sizeof (EXPR_VARINFO) * (allvars - nvars);
+
+	s = malloc (size);
+	if (s == NULL)
+		return -1;
+
+	pMem = (char *)s;
+	pMem += sizeof (PROOF_STEP) * thm->nSteps;
+
+	vmap += thm->stmt->nMand; /* skip over vMap entries corresponding to
+				     mandatory variables */
+
+	vi = (EXPR_VARINFO *)pMem; /* This is where the EXPR_VARINFO's for
+				      variables in the proof steps but not in
+				      the hypotheses or conclusions will be
+				      finally put */
+
+	for (i = 0; i < allvars - nvars; ++i) {
+		*(EXPR_VARINFO *)pMem = *vmap [i].vi;
+		/* all of these variables must correspond to global VARs,
+		   we don't need to worry about ref counts */
+		pMem += sizeof (EXPR_VARINFO);
+	}
+	for (i = 0; i < thm->nSteps; ++i) {
+		s[i] = thm->steps[i]; /* copy the step itself */
+		/* now copy any associated expressions */
+		if (s[i].s.type == STEPT_EXPR)
+			s[i].expr.x = exprCopy (s[i].expr.x, &pMem,
+						vi, nvars);
+	}
+	thm->steps = s;
+	thm->stmt->thm = thm;
+	return 0;
+}
+
 typedef struct _LOAD_CONTEXT {
 	IMPORT_CONTEXT ic; /* not all fields used */
 	int interactive;
@@ -4662,6 +5275,7 @@ load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
 	VMAP * vmap;
 	DVC2 dv;
 	CHECK_CONC_CTX checkCtx;
+	int pairs;
 
 	sctx.ec.terms = shul->terms;
 	sctx.ec.syms = shul->syms;
@@ -4685,8 +5299,7 @@ load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
 		goto load_thm_bad1;
 	}
 
-	thm->stmt = stat;
-	/* stat->thm = thm; */
+	thm->stmt = stat; /* We'll link stat to thm if we keep the proof */
 
 	i = 0;
 	for (item = sctx.hypItem; item != NULL; item = item->it.next) {
@@ -4707,11 +5320,6 @@ load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
 		++i;
 
 	thm->nSteps = i;
-	if ((thm->steps = malloc (i * sizeof (PROOF_STEP))) == NULL) {
-		perror ("load_thm:malloc[2]");
-		goto load_thm_bad2;
-	}
-
 	tip.t = thm;
 	tip.s = thm->stmt;
 	tip.step = 0;
@@ -4724,6 +5332,13 @@ load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
 
 	exprStackInit (&tip.ps, &tip.arena);	/* proof stack */
 	exprStackInit (&tip.mvs, &tip.arena);	/* mand. var. stack */
+
+	if ((thm->steps = arenaAlloc (&tip.arena,
+				      i * sizeof (PROOF_STEP))) == NULL) {
+		perror ("load_thm:arenaAlloc[1]");
+		goto load_thm_bad2;
+	}
+
 
 	for (item = sctx.proofStepItem; item != NULL;
 	     item = item->it.next, ++tip.step) {
@@ -4757,7 +5372,7 @@ load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
 		}
 
 		/* next check for a variable occurring in the
-		   hypotheses or conclusions */
+		   hypotheses or conclusions (or one already seen) */
 
 		ex = mapVal (id, tip.varIndex);
 		if (ex != NULL) {
@@ -4806,8 +5421,7 @@ load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
 			goto checkstep;
 		}
 
-		assert (sym->stype == ST_STMT ||
-			sym->stype == ST_THM);
+		assert (sym->stype == ST_STMT);
 
 		step->ref.s.type = STEPT_REF;
 		step->ref.stat = (STATEMENT *)sym;
@@ -4937,8 +5551,8 @@ checkstep:
 
 	/* clear dvbits here when we know how many pairs we might have */
 
-	allvars = allvars * (allvars - 1) / 2; /* pairs */
-	memset (shul->dvbits, 0, BIT_MAP_SIZE(allvars));
+	pairs = allvars * (allvars - 1) / 2;
+	memset (shul->dvbits, 0, BIT_MAP_SIZE(pairs));
 
 	me = mapElemInsert (stat->sym.ident, shul->syms);
 	if (me == NULL) {
@@ -4952,22 +5566,34 @@ checkstep:
 	assert (me->v.p == NULL);
 
 	me->v.p = stat;
-	stat->sym.ident->refcount++;
+	/* parseStatement() incremented stat->sym.ident->refcount */
+
+	if (histAdd (shul, HT_THM, stat) != 0)
+		goto load_thm_bad4;
+
+	if (shul->saveProof) {
+		if (proofHold (thm, allvars, vmap, shul) != 0) {
+			fprintf (stderr, "Warning: cannot keep proof.\n");
+			goto dropProof;
+		}
+	} else {
+dropProof:
+		/* Here we don't hold on to the THEOREM, just the STATEMENT. */
+		for (i = 0; i < thm->stmt->nHyps; ++i)
+			identFree (thm->hypnam[i]);
+		free (thm);
+	}
 
 	arenaFree (&tip.arena);
 
-	/* For now, we don't hold on to the THEOREM, just the STATEMENT.
-	 * If we eventually want to hold on to the proof steps, keep in
-	 * mind that these presently reference memory in the arena,
-	 * so we would have to copy it elsewhere if we want to free
-	 * tip.arena.
-	 */
-
-	free (thm->steps);
-	free (thm);
 	mappingEmpty (sctx.ec.varIndex, NULL, NULL);
+	mappingDelete (sctx.hypnams, NULL, NULL);
 
 	return 0;
+
+load_thm_bad4:
+	mapElemDelete (me->obj, shul->syms);
+	stat->sym.ident->refcount--;
 
 load_thm_bad3:
 
@@ -4976,8 +5602,6 @@ load_thm_bad3:
 	tipShow (stderr, &tip);
 
 	arenaFree (&tip.arena);
-
-	free (thm->steps);
 
 load_thm_bad2:
 	free (thm);
@@ -4988,6 +5612,9 @@ load_thm_bad1:
 	statementFree (stat);
 
 load_thm_bad0:
+	if (sctx.hypnams != NULL)
+		identTableDelete (sctx.hypnams);
+
 	if (!((LOAD_CONTEXT *)ctx)->interactive &&
 	    shul->verbose <= 10) {
 		fprintf (stderr, "thm ");
@@ -5000,7 +5627,10 @@ load_thm_bad0:
 static int
 load_var (SHULLIVAN * shul, ITEM * arg, void * ctx)
 {
-	return import_var (shul, arg, ctx);
+	LOAD_CONTEXT * lc = ctx;
+	lc->ic.keephist = 1;
+	
+	return import_var (shul, arg, &lc->ic);
 }
 
 static int
@@ -5118,7 +5748,7 @@ load_def (SHULLIVAN * shul, ITEM * arg, void * ctx)
 
 	def = malloc (size);
 	if (def == NULL) {
-		perror ("load_def:calloc");
+		perror ("load_def:malloc");
 		goto load_def_bad1;
 	}
 
@@ -5161,11 +5791,17 @@ load_def (SHULLIVAN * shul, ITEM * arg, void * ctx)
 
 	me->v.p = def;
 
+	if (histAdd (shul, HT_DEF, def) != 0)
+		goto load_def_bad3;
+
 	id->refcount++; /* the definition identifier */
 
 	mappingEmpty (parseCtx.varIndex, NULL, NULL);
 
 	return 0;
+
+load_def_bad3:
+	mapElemDelete (id, shul->terms);
 
 load_def_bad2:
 	for (i = 0; i < def->t.arity + def->ndummies; ++i) {
@@ -5251,10 +5887,26 @@ load_kindbind (SHULLIVAN * shul, ITEM * arg, void * ctx)
 		goto load_kindbind_bad1;
 	}
 	me->v.p = k2;
+
+	/*
+	 * We record the type bound to in a separate history item
+	 * in case the rep is changed by a subsequent kindbind done
+	 * in an import.
+	 */
+
+	if (histAdd (shul, HT_KINDBIND0, k1) != 0)
+		goto load_kindbind_bad2;
+	if (histAdd (shul, HT_KINDBIND, k2) != 0) {
+		shul->histlen --;
+		goto load_kindbind_bad2;
+	}
+
 	k2Item->id.id->refcount++;
 
 	return 0;
 
+load_kindbind_bad2:
+	mapElemDelete (me->obj, shul->kinds);
 load_kindbind_bad1:
 	free (k2);
 	return -1;
@@ -5358,13 +6010,19 @@ static int
 thm (SHULLIVAN * shul, ITEM * arg)
 {
 	LOAD_CONTEXT ctx;
+	int res;
+	int oldSaveProof = shul->saveProof;
+
+	shul->saveProof = 1; /* always save interactive proofs */
 
 	ctx.ic.iface = NULL;
 	ctx.ic.localSyms = shul->syms;
 	ctx.ic.localKinds = shul->kinds;
 	ctx.interactive = 1;
 
-	return load_thm (shul, arg, &ctx);
+	res =  load_thm (shul, arg, &ctx);
+	shul->saveProof = oldSaveProof;
+	return res;
 }
 
 static int
@@ -5381,6 +6039,19 @@ var (SHULLIVAN * shul, ITEM * arg)
 }
 
 static int
+kindbind (SHULLIVAN * shul, ITEM * arg)
+{
+	LOAD_CONTEXT ctx;
+
+	ctx.ic.iface = NULL;
+	ctx.ic.localSyms = shul->syms;
+	ctx.ic.localKinds = shul->kinds;
+	ctx.interactive = 1;
+
+	return load_kindbind (shul, arg, &ctx);
+}
+
+static int
 def (SHULLIVAN * shul, ITEM * arg)
 {
 	LOAD_CONTEXT ctx;
@@ -5392,6 +6063,17 @@ def (SHULLIVAN * shul, ITEM * arg)
 
 	return load_def (shul, arg, &ctx);
 }
+
+static int
+saveProofToggle (SHULLIVAN * shul, ITEM * arg)
+{
+	shul->saveProof = !shul->saveProof;
+	printf ("Proofs will be %s.\n", 
+		shul->saveProof ? "kept" : "discarded");
+	return 0;
+}
+
+
 
 #define CMD_OPT_SEXPR	1
 
@@ -5408,6 +6090,9 @@ commandLookup (char * cmd, int cmdlen, int * pOpts)
 	if (strcmp (cmd, "echo") == 0) {
 		return echo;
 	}
+	if (strcmp (cmd, "erase") == 0) {
+		return erase;
+	}
 	if (strcmp (cmd, "export") == 0) {
 		return export;
 	}
@@ -5417,8 +6102,14 @@ commandLookup (char * cmd, int cmdlen, int * pOpts)
 	if (strcmp (cmd, "import") == 0) {
 		return import;
 	}
+	if (strcmp (cmd, "kindbind") == 0) {
+		return kindbind;
+	}
 	if (strcmp (cmd, "load") == 0) {
 		return load;
+	}
+	if (strcmp (cmd, "save") == 0) {
+		return save;
 	}
 	if (strcmp (cmd, "thm") == 0) {
 		return thm;
@@ -5436,20 +6127,32 @@ commandLookup (char * cmd, int cmdlen, int * pOpts)
 	if (strcmp (cmd, "defs") == 0) {
 		return defList;
 	}
+	if (strcmp (cmd, "history") == 0) {
+		return history;
+	}
 	if (strcmp (cmd, "kinds") == 0) {
 		return kindList;
 	}
 	if (strcmp (cmd, "kindsraw") == 0) {
 		return kindsRaw;
 	}
+	if (strcmp (cmd, "identifiers") == 0) {
+		return identifierList;
+	}
 	if (strcmp (cmd, "interfaces") == 0) {
 		return interfaceList;
+	}
+	if (strcmp (cmd, "keep") == 0) {
+		return saveProofToggle;
 	}
 	if (strcmp (cmd, "statements") == 0) {
 		return statementList;
 	}
 	if (strcmp (cmd, "terms") == 0) {
 		return termList;
+	}
+	if (strcmp (cmd, "undo") == 0) {
+		return undo;
 	}
 	if (strcmp (cmd, "variables") == 0) {
 		return varList;
@@ -5684,11 +6387,15 @@ main (int argc, char * argv [])
 
 	shul.ndvvars = 16;
 	shul.dvsize = BIT_MAP_SIZE (shul.ndvvars * (shul.ndvvars - 1) / 2);
+	shul.histlen = 0;
+	shul.histmax = HISTORY_TOP_LEVEL_SIZE;
 
 	if (shulIdentInit() != 0 ||
 	    growBufInit (&shul.vi, 16 * sizeof (EXPR_VARINFO)) != 0 ||
 	    growBufInit (&shul.env, 32 * sizeof (EXPR *)) != 0 ||
 	    growBufInit (&shul.dvw, 32 * sizeof (DVWORK)) != 0 ||
+	    (shul.history = calloc (shul.histmax,
+				    sizeof (*shul.history))) == NULL ||
 	    (shul.dvbits = calloc (1, shul.dvsize)) == NULL ||
 	    (shul.varIndex = mappingCreate (NULL)) == NULL ||
 	    (shul.interfaces = mappingCreate (NULL)) == NULL ||

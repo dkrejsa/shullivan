@@ -48,8 +48,6 @@ arenaInit (ARENA * a, size_t blksize, size_t maxsize,
  * Note, arenaAlloc(a, 0) may return NULL.
  */
 
-#define ARENA_ALIGN	8
-
 void *
 arenaAlloc (ARENA * a, size_t n)
 {

@@ -3,7 +3,7 @@
 #ifndef __INCshullivanh
 #define __INCshullivanh
 
-#define SHULLIVAN_VERSION "0.01"
+#define SHULLIVAN_VERSION "0.02"
 
 /*
  * Lexical items - identifiers and s-lists
@@ -155,7 +155,6 @@ typedef enum _SYMBOL_TYPE {
 			   logical connective */
 	ST_DEF,		/* defined term */
 
-	ST_THM,		/* Theorem name */
 	ST_STMT,	/* Statement name */
 	ST_VAR,		/* Variable name */
 } SYMBOL_TYPE;
@@ -236,9 +235,11 @@ struct _INTERFACE {
 
 	IDENT_TABLE * kinds;	/* kinds added by this interface. */
 	IDENT_TABLE * terms;	/* terms added by this interface. */
+	MAPPING * origKinds;	/* for undoing kindbinds by the interface */
 
 	char * prefix;		/* prefix */
 	int pfxlen;		/* prefix length, not counting NUL */
+	IDENT * fileId;		/* identifier with filename/URL */
 	int import;		/* 1 --> import; 0 --> export */
 };
 

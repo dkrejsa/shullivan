@@ -60,6 +60,7 @@ static SPLAY_MAP_ELEM * freeElems = NULL;
 
 unsigned long numMapElems = 0;
 unsigned long freeMapElems = 0;
+unsigned long mappings = 0;
 
 MAPPING *
 mappingCreate (CMP_FUNC compare)
@@ -69,6 +70,7 @@ mappingCreate (CMP_FUNC compare)
 	if (t == NULL) {
 		return NULL;
 	}
+	++mappings;
 	t->map.user = NULL;
 	t->map.size = 0;
 	t->head = NULL;
@@ -106,6 +108,7 @@ mappingDelete (MAPPING * table, MAP_DELETE_FUNC f, void * ctx)
 		mapElemDelete (me->me.obj, &t->map);
 	}
 	free (t);
+	--mappings;
 }
 
 MAP_ELEM *

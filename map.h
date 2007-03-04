@@ -50,6 +50,7 @@ typedef struct _MAPPING {
 /* Debug, number of map elements in use */
 extern unsigned long numMapElems;
 extern unsigned long freeMapElems;
+extern unsigned long mappings;
 
 extern MAPPING * mappingCreate (CMP_FUNC compare);
 

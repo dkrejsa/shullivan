@@ -24,6 +24,8 @@ typedef struct _IDENT {
  */
 typedef MAPPING IDENT_TABLE;
 
+extern IDENT_TABLE * allIdents; /* Debug, treat as read only! */
+
 extern unsigned long numIdents; /* Debug, number of IDENTs in use */
 
 extern int shulIdentInit (void);
