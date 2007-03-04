@@ -127,7 +127,6 @@ typedef struct _INTERFACE INTERFACE;
  * classes (if not already linked). The new representative will
  * be the earlier* of the current representatives of the two classes;
  * all the kinds in the old class not containing that representative
- * Keep kind identifiers pointing at the initial kinds.
  * will be updated to point to the new representative.
  *
  * *'earliest' in some convenient ordering (which is not critical)
@@ -284,7 +283,7 @@ typedef struct _STATEMENT {
 	int		nCons;	/* number of conclusions */
 	EXPR **		cons;	/* array of conclusions */
 	int		nhvars;	/* number of different variables
-				   occurring the hypotheses. */
+				   occurring in the hypotheses. */
 	int		nWild;	/* Number of 'wild' variables. */
 	uint32_t *	dvbits; /* pointer to distinct var bitmap */
 	THEOREM *	thm;	/* NULL unless this is a theorem */

@@ -1299,7 +1299,9 @@ printHelp (void)
 "       load path/to/basename\n"
 "save           - save results to a file\n"
 "       save (FILENAME [START_HISTNUM])\n"
+"statements     - list statements\n"
 "stats          - print various statistics\n"
+"terms          - list terms\n"
 "thm            - verify theorem\n"
 "       thm (THMID ([(DVVAR1 ...) ...]) ([(HYPNAM HYP) ...])\n"
 "                  {CONCL | ([CONCL ...])} (STEP ...))\n"
@@ -1674,6 +1676,7 @@ dvEnumerate (int nvars, uint32_t * dvbits, DV_ENUMERATE_FUNC f, void * ctx)
 #define PRINT_INTERNAL	32 /* applies to histPrint() */
 #define PRINT_PRETTY	64
 #define PRINT_DEF_AS_TERM 128  /* applies to histPrint() */
+#define PRINT_MULT_CONC 256    /* always use multiple conclusion syntax */
 
 static void
 statementPrint (FILE * f, STATEMENT * s, unsigned long verbose)
@@ -1734,7 +1737,7 @@ statementPrint (FILE * f, STATEMENT * s, unsigned long verbose)
 	else {
 		indent += fprintf (f, ") ");
 	}
-	if (s->nCons != 1)
+	if (s->nCons != 1 || (verbose & PRINT_MULT_CONC) != 0)
 		fprintf (f, "(");
 	else
 		indent--;
@@ -1748,7 +1751,7 @@ statementPrint (FILE * f, STATEMENT * s, unsigned long verbose)
 		}
 		exprPrint (f, s->cons[i], exprVerbose, indent);
 	}
-	if (s->nCons != 1) {
+	if (s->nCons != 1 || (verbose & PRINT_MULT_CONC) != 0) {
 		indent--;
 		fprintf (f, ")");
 	}
@@ -1810,6 +1813,8 @@ statementList (SHULLIVAN * shul, ITEM * ignored)
 	pmc.verbose = PRINT_VERBOSE | (2 << 16); /* 2 spaces indent */
 	if (shul->verbose & SHUL_VERB_PRINT_PRETTY)
 		pmc.verbose |= PRINT_PRETTY;
+	if (shul->flags & REQ_MULT_CONC_SYNTAX)
+		pmc.verbose |= PRINT_MULT_CONC;
 
 	for (i = 0; i < shul->histlen; ++i) {
 		hi = &shul->history[i / HISTORY_CHUNK_SIZE]->
@@ -2146,7 +2151,7 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 	size_t bmap_size = 0; /* avoid gcc warning, not really necessary */
 	int nhyps;
 	int nconcs;
-	int nmand;
+	int nWild;
 	int nvars;
 	TERM * term;
 	int i;
@@ -2282,8 +2287,14 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 
 	concStop = NULL;
 
-	if (concItem->it.itype == IT_IDENT)
+	if (concItem->it.itype == IT_IDENT) {
+		if ((shul->flags & REQ_MULT_CONC_SYNTAX) != 0) {
+			fprintf (stderr, "*** Multiple conclusions syntax is "
+				 "required.\n");
+			goto parseStatement_bad2;
+		}
 		goto oldConcSyntax;
+	}
 
 	assert (concItem->it.itype == IT_SLIST);
 
@@ -2291,7 +2302,8 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 
 	/* Note, 0 conclusions is allowed, e.g. 'drop'. */
 
-	if (item != NULL && item->it.itype == IT_IDENT &&
+	if ((shul->flags & REQ_MULT_CONC_SYNTAX) == 0 &&
+	    item != NULL && item->it.itype == IT_IDENT &&
 	    (term = mapVal (item->id.id, ctx->ec.terms))
 	    != NULL) {
 
@@ -2320,7 +2332,7 @@ oldConcSyntax:
 		concItem = item;
 	}
 
-	nmand = ctx->ec.varIndex->size; /* fix up later */
+	nWild = ctx->ec.varIndex->size; /* fix up later */
 
 	/* process the conclusions */
 
@@ -2333,7 +2345,7 @@ oldConcSyntax:
 
 	nvars = ctx->ec.varIndex->size;
 
-	nmand = nvars - nmand; /* now correct */
+	nWild = nvars - nWild; /* now correct */
 
 	/*
 	 * OK, check for variables with no kind inferred yet;
@@ -2384,9 +2396,9 @@ oldConcSyntax:
 	stat->sym.ident = pid;
 	stat->nHyps = nhyps;
 	stat->nCons= nconcs;
-	stat->nWild = nmand;
+	stat->nWild = nWild;
 	stat->iface = ctx->iface;
-	stat->nhvars = nvars - nmand;
+	stat->nhvars = nvars - nWild;
 
 	for (i = 0; i < nvars; ++i) {
 		stat->vi[i] = ctx->ec.vars[i];
@@ -2891,7 +2903,8 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 
 		/* Note, 0 conclusions is allowed, e.g. 'drop'. */
 
-		if (item == NULL || item->it.itype != IT_IDENT ||
+		if ((shul->flags & REQ_MULT_CONC_SYNTAX) != 0 ||
+		    item == NULL || item->it.itype != IT_IDENT ||
 		    (term = mapVal (item->id.id, ctx.ec.terms)) == NULL) {
 			if ((shul->flags & MULTIPLE_CONCLUSIONS) == 0) {
 				if (item != NULL && item->it.itype == IT_IDENT)
@@ -2908,6 +2921,11 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 			}
 			concItem = item;
 		}
+	} else if ((shul->flags & REQ_MULT_CONC_SYNTAX) != 0) {
+		fprintf (stderr,
+			 "*** Multiple conclusions syntax is required "
+			 "for statement %s\n", stat->sym.ident->name);
+		return -1;
 	}
 
 	/* quick count of conclusions */
@@ -4705,9 +4723,12 @@ flags (SHULLIVAN * shul, ITEM * sexpr)
 		return -1;
 	}
 	flg = strtol (sexpr->id.id->name, &stop, 0);
-	if (stop != sexpr->id.id->name)
+	if (stop != sexpr->id.id->name) {
+		/* REQ_MULT_CONC_SYNTAX implies MULTIPLE_CONCLUSIONS */
+		if (flg & REQ_MULT_CONC_SYNTAX)
+			flg |= MULTIPLE_CONCLUSIONS;
 		shul->flags = flg;
-	else {
+	} else {
 		flg = shul->flags;
 		printf ("Current shullivan flags : 0x%lx\n", flg);
 		printf ("0x%x : Allow statements with 0 or more "
@@ -4722,6 +4743,9 @@ flags (SHULLIVAN * shul, ITEM * sexpr)
 		printf ("0x%x : Print warnings about unneeded DV items in "
 			"exported statements [%s]\n", EXPORT_WARN_DV,
 			(flg & EXPORT_WARN_DV) ? "On" : "Off");
+		printf ("0x%x : Require multiple conclusion syntax [%s]\n",
+			REQ_MULT_CONC_SYNTAX, 
+			(flg & REQ_MULT_CONC_SYNTAX) ? "On" : "Off");
 	}
 	return 0;
 }
@@ -4742,6 +4766,9 @@ histPrint (FILE * f, SHULLIVAN * shul,
 
 	assert (shul != NULL && 
 		start <= shul->histlen && stop <= shul->histlen);
+
+	if (shul->flags & REQ_MULT_CONC_SYNTAX)
+		verbose |= PRINT_MULT_CONC;
 
 	for (i = start; i < stop; ++i) {
 		hi = &shul->history[i / HISTORY_CHUNK_SIZE]->
@@ -5625,7 +5652,7 @@ checkstep:
 				    SHUL_VERB_PRINT_PRETTY)
 					verbose |= PRINT_PRETTY;
 				fprintf (stderr, "Failed applying:\n");
-				
+
 				statementPrint (stderr, 
 						step->ref.stat,
 						verbose);

@@ -1,3 +1,7 @@
+Changes in 0.06:
+ - Support flag (REQ_MULT_CONC_SYNTAX) requiring use of the multiple
+   conclusions syntax.
+
 Changes in 0.05:
  - The previous version would die with an assertion failure for some cases
    in which a later interface file introduced a statement with the same name
