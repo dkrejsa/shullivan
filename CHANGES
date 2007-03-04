@@ -1,3 +1,16 @@
+Changes in 0.05:
+ - The previous version would die with an assertion failure for some cases
+   in which a later interface file introduced a statement with the same name
+   as one introduced in an earlier interface file, rather than produce a
+   helpful diagnostic. Fix that.
+ - The previous version could halt with an assertion failure in some cases
+   where a variable was introduced with the same name as an existing statement.
+ - Rename 'mandatory variables' as 'wild variables' for better agreement
+   with metamath usage and upcoming Ghilbert specification.
+ - Correct some error messages and normal output to be more accurate and
+   useful.
+
+
 Changes in 0.04:
  - Add the ability to pretty-print expressions (SHUL_VERB_PRETTY_PRINT
    verbose flag) and to print detailed results produced during proofs

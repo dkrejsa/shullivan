@@ -3,7 +3,7 @@
 #ifndef __INCshullivanh
 #define __INCshullivanh
 
-#define SHULLIVAN_VERSION "0.04"
+#define SHULLIVAN_VERSION "0.05"
 
 /*
  * Lexical items - identifiers and s-lists
@@ -86,14 +86,14 @@ union _ITEM {
  *
  * Proof steps may be:
  *  - names of theorems (or other proven/assumed statements)
- *  - variables (these go on the mandatory variable stack for a
+ *  - variables (these go on the wild variable stack for a
  *    statement to be applied in a subsequent proof step)
  *  - names of hypotheses of the theorem being proved
  * and
  *  - non-identifier S-expressions.
  *
  * The non-identifier S-expressions are distinguishable from the others,
- * and like variable names, go onto the mandatory variable stack for
+ * and like variable names, go onto the wild variable stack for
  * use by subsequent theorem references.
  *
  * The scope of a hypothesis name is just the theorem itself.
@@ -285,18 +285,17 @@ typedef struct _STATEMENT {
 	EXPR **		cons;	/* array of conclusions */
 	int		nhvars;	/* number of different variables
 				   occurring the hypotheses. */
-	int		nMand;	/* Number of 'mandatory hypothesis'
-				   variables. */
+	int		nWild;	/* Number of 'wild' variables. */
 	uint32_t *	dvbits; /* pointer to distinct var bitmap */
 	THEOREM *	thm;	/* NULL unless this is a theorem */
 
 	EXPR_VARINFO vi [1];	/* 
 				   Variable length array. Must be last.
 				   Information for the nhvars +
-				   nMand variables (in order with
-				   mandatory variables last). The kinds
+				   nWild variables (in order with
+				   wild variables last). The kinds
 				   are critical, particularly for
-				   the mandatory variables, but the
+				   the wild variables, but the
 				   identifiers are needed only for
 				   show routines or error messages to
 				   the user. They will not be in the
@@ -306,7 +305,7 @@ typedef struct _STATEMENT {
 
 typedef enum _STEP_TYPE {
 	STEPT_REF,	/* Reference to proved theorem or axiom */
-	STEPT_EXPR,	/* Expression for mandatory hyp/variable */
+	STEPT_EXPR,	/* Expression for wild hyp/variable */
 	STEPT_HYP	/* Reference to theorem hypothesis */
 } STEP_TYPE;
 
@@ -358,7 +357,7 @@ typedef struct _EXPR_STACK {
 
 /*
  * Mapping from the variables occurring in a statement's formal
- * hypotheses and its mandatory hypothesis variables, to expressions.
+ * hypotheses and its wild hypothesis variables, to expressions.
  */
 typedef struct _ENVIRONMENT {
 	void * TBD;
@@ -370,8 +369,7 @@ typedef struct _TIP {
 	THEOREM *	t;
 	STATEMENT *	s;	/* shortcut to t->stmt */
 	EXPR_STACK	ps;	/* the proof stack (list?) */
-	EXPR_STACK	mvs;	/* stack for mandatory variable
-				   substitutions */
+	EXPR_STACK	wvs;	/* stack for wild variable substitutions */
 	IDENT_TABLE *   hypnams;	/* hypothesis name lookup table */
 	IDENT_TABLE *	varIndex;	/* variable lookup */
 	int		step;   /* current proof step number */

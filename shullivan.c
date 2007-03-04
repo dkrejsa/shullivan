@@ -158,7 +158,7 @@ typedef struct _SHULLIVAN {
 #define SHUL_VERB_PROGRESS	1	/* note import, export, thm verify */
 #define SHUL_VERB_COMMANDS	2	/* echo all commands */
 #define SHUL_VERB_PROOF		4	/* print all results in proof */
-#define SHUL_VERB_PRFMAND	8	/* print mandatory hyps in proof */
+#define SHUL_VERB_PRFWILD	8	/* print wild var hyps in pf. */
 #define SHUL_VERB_PRINT_PRETTY	16	/* pretty-print expressions */
 
 	unsigned long flags;
@@ -167,6 +167,7 @@ typedef struct _SHULLIVAN {
 #define LOOSE_VAR_KINDS	2		/* allow variable kind inferrence */
 #define EXPORT_LOOSE_VAR_KINDS 4	/* var kind inference in export */
 #define EXPORT_WARN_DV 8		/* Warn of unneeded DVs in export */
+#define REQ_MULT_CONC_SYNTAX 16		/* Multiple conclusion syntax req'd. */
 } SHULLIVAN;
 
 typedef int (*COMMAND_FUNC) (SHULLIVAN * shul, ITEM * item);
@@ -494,7 +495,7 @@ typedef struct _DVC2 {
 	uint32_t * dvbits;  /* DV bitmap for theorem being proved */
 	int missing;
 	int bad;
-	int nvars;	/* stat->nhvars + stat->nMand for theorem in prog. */
+	int nvars;	/* stat->nhvars + stat->nWild for theorem in prog. */
 	int nhvars;	/* stat->nhvars */
 	EXPR_VARINFO * vi;
 	VMAP * vmap;
@@ -773,10 +774,10 @@ proofStepApply (SHULLIVAN * shul, TIP * tip, PROOF_STEP * s)
 	int indent;
 
 	if (s->s.type == STEPT_HYP) {
-		if (tip->mvs.count != 0) {
+		if (tip->wvs.count != 0) {
 			fprintf (stderr,
 				 "*** Hypothesis pushed with non-empty "
-				 "mandatory variable stack.\n");
+				 "wild variable stack.\n");
 			return -1;
 		}
 
@@ -792,18 +793,18 @@ proofStepApply (SHULLIVAN * shul, TIP * tip, PROOF_STEP * s)
 
 	if (s->s.type == STEPT_EXPR) {
 		/*
-		 * We allow pushing any expression onto the mandatory
+		 * We allow pushing any expression onto the wild
 		 * variable hypothesis stack. All checking is done when
 		 * a theorem reference is applied. If there is stuff
-		 * left on the mvs stack at the end of the proof, a
+		 * left on the wvs stack at the end of the proof, a
 		 * warning is generated.
 		 */
-		if (shul->verbose & SHUL_VERB_PRFMAND) {
+		if (shul->verbose & SHUL_VERB_PRFWILD) {
 			j = printf ("M  ");
 			exprPrint (stdout, s->expr.x, shul->verbose, j);
 			printf ("\n");
 		}
-		return exprStackPush (&tip->mvs, s->expr.x);
+		return exprStackPush (&tip->wvs, s->expr.x);
 	}
 
 	assert (s->s.type == STEPT_REF);
@@ -818,26 +819,26 @@ proofStepApply (SHULLIVAN * shul, TIP * tip, PROOF_STEP * s)
 	}
 
 	/* 
-	 * We don't allow saving items on the mandatory
+	 * We don't allow saving items on the wild
 	 * variable stack between references, so the counts
 	 * must match exactly.
 	 */
-	if (stat->nMand != tip->mvs.count) {
+	if (stat->nWild != tip->wvs.count) {
 		fprintf (stderr,
-			 "Expected %d mandatory hypotheses, had %d\n",
-			 stat->nMand, tip->mvs.count);
+			 "*** Expected %d wild var hypotheses, "
+			 "had %d\n", stat->nWild, tip->wvs.count);
 		return -1;
 	}
 
 	/* 
 	 * env holds information about the values assigned
 	 * to variables occurring in the formal hypotheses
-	 * and mandatory variables of the statement being
+	 * and wild variables of the statement being
 	 * referenced during the matching with the provided
 	 * actual hypotheses.
 	 */
 
-	nvars = stat->nhvars + stat->nMand;
+	nvars = stat->nhvars + stat->nWild;
 
 	if (nvars * sizeof (EXPR *) > shul->env.size &&
 	    growBufInit (&shul->env, 2 * nvars * sizeof (EXPR *)) != 0) {
@@ -864,25 +865,25 @@ proofStepApply (SHULLIVAN * shul, TIP * tip, PROOF_STEP * s)
 
 	j = stat->nhvars;
 
-	/* Assign mandatory hypothesis variables */
+	/* Assign wild hypothesis variables */
 
-	for (i = 0; i < stat->nMand ; ++i) {
+	for (i = 0; i < stat->nWild ; ++i) {
 		assert (env[i+j] == NULL);
 
 		if (stat->vi[i+j].ex.kind->rep != 
-		    tip->mvs.exprs[i]->ex.kind->rep) {
+		    tip->wvs.exprs[i]->ex.kind->rep) {
 			fprintf (stderr,
 				 "Kind mismatch got %s wanted %s for %s\n",
-				  tip->mvs.exprs[i]->ex.kind->id->name,
+				  tip->wvs.exprs[i]->ex.kind->id->name,
 				  stat->vi[i+j].ex.kind->id->name,
 				  stat->vi[i+j].id->name);
 
 			return -1;
 		}
-		env[i+j] = tip->mvs.exprs[i];
+		env[i+j] = tip->wvs.exprs[i];
 #if 0
 		printf ("mv map %s (%d) to ", stat->vi[i+j].id->name, i+j);
-		exprPrint (stdout, tip->mvs.exprs[i], 0, 0);
+		exprPrint (stdout, tip->wvs.exprs[i], 0, 0);
 		printf ("\n");
 #endif
 	}
@@ -922,9 +923,9 @@ proofStepApply (SHULLIVAN * shul, TIP * tip, PROOF_STEP * s)
 		return -1;
 	}
 
-	/* Clear the mandatory variable stack */
+	/* Clear the wild variable stack */
 
-	tip->mvs.count = 0;
+	tip->wvs.count = 0;
 
 	/*
 	 * OK, everything's good. Pop off the actual hypotheses
@@ -1705,7 +1706,7 @@ statementPrint (FILE * f, STATEMENT * s, unsigned long verbose)
 		sp.space = &space;
 		sp.s = s;
 		sp.f = f;
-		dvEnumerate (s->nhvars + s->nMand, s->dvbits,
+		dvEnumerate (s->nhvars + s->nWild, s->dvbits,
 			     dvPairPrint, &sp);
 		fprintf (f, ")\n%*s(", indent - 1, "");
 	} else {
@@ -2175,7 +2176,7 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 			   "{CONCL | ([CONCL ...])} (STEP ...))\n");
 		else
 			fprintf (stderr,
-			   "*** expected thm (NAME ([(VAR1 VAR2 ...)]) "
+			   "*** expected stmt (NAME ([(VAR1 VAR2 ...)]) "
 			   "([HYP ...]) {CONCL | ([CONCL ...])})\n");
 		
 		return NULL;
@@ -2190,6 +2191,18 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 		ctx->hypItem = hypItem->sl.first;
 	}
 
+	/*
+	 * Note, we don't insert the theorem symbol yet, so that
+	 * it can't be used in its own proof (or partially 
+	 * initialized in its own definition, for a 'stmt').
+	 */
+
+	if (mapVal (nameItem->id.id, ctx->ec.syms) != NULL) {
+		fprintf (stderr, "*** symbol '%s' already exists.\n",
+			 nameItem->id.id->name);
+		return NULL;
+	}
+
 	if (ctx->iface != NULL) {
 		pid = identPrefixed (ctx->iface->prefix,
 				     ctx->iface->pfxlen,
@@ -2198,21 +2211,17 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 			perror ("parseStatement:identPrefixed");
 			return NULL;
 		}
+		/*
+		 * Check ALSO in shul->syms for the prefixed name.
+		 */
+		if (mapVal (pid, shul->syms) != NULL) {
+			fprintf (stderr, "*** symbol '%s' already exists.\n",
+				 pid->name);
+			goto parseStatement_bad1;
+		}
 	} else {
 		pid = nameItem->id.id;
 		pid->refcount++;
-	}
-
-	/* 
-	 * Note, we don't insert the theorem symbol yet, so that
-	 * it can't be used in its own proof (or partially 
-	 * initialized in its own definition, for a 'stmt').
-	 */
-
-	if (mapVal (pid, ctx->ec.syms) != NULL) {
-		fprintf (stderr, "*** symbol '%s' already exists.\n",
-			 pid->name);
-		goto parseStatement_bad1;
 	}
 
 	/*
@@ -2375,7 +2384,7 @@ oldConcSyntax:
 	stat->sym.ident = pid;
 	stat->nHyps = nhyps;
 	stat->nCons= nconcs;
-	stat->nMand = nmand;
+	stat->nWild = nmand;
 	stat->iface = ctx->iface;
 	stat->nhvars = nvars - nmand;
 
@@ -2727,7 +2736,7 @@ statementFree (STATEMENT * stat)
 		free (thm);
 	}
 	identFree (stat->sym.ident);
-	i = stat->nhvars + stat->nMand;
+	i = stat->nhvars + stat->nWild;
 	while (i > 0) {
 		--i;
 		identFree (stat->vi[i].id);
@@ -2824,7 +2833,7 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 	    (concItem = hypItem->it.next) == NULL ||
 	    concItem->it.next != NULL) {
 		fprintf (stderr,
-			 "*** expected thm (NAME ([(VAR1 VAR2 ...)]) "
+			 "*** expected stmt (NAME ([(VAR1 VAR2 ...)]) "
 			 "([HYP ...]) {CONCL | ([CONCL ...])})\n");
 		return -1;
 	}
@@ -2921,7 +2930,7 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 	 * we initialize the rest of ctx.ec (or that part which we need).
 	 */
 
-	nvars = stat->nhvars + stat->nMand;
+	nvars = stat->nhvars + stat->nWild;
 
 	/* 
 	 * shul->vi was used when parsing the statement originally,
@@ -2961,7 +2970,7 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 	 * - A reverse look-up array from the existing statement's variables
 	 *   to the new identifiers.  This lets us stop immediately if
 	 *   more than one identifier gets mapped to the same existing
-	 *   statement, rather than just counting at the end.
+	 *   statement variable, rather than just counting at the end.
 	 */
 
 	i = 0;
@@ -3261,14 +3270,21 @@ import_var_format:
 		}
 
 		if (me->v.p != NULL) {
+			SYMBOL * sym = me->v.p;
 			varFree (var);
+			if (sym->stype != ST_VAR) {
+				assert (sym->stype == ST_STMT);
+				fprintf (stderr, "*** name '%s' already exists"
+					 " as statement.\n", id->name);
+				return -1;
+			}
 			if ((shul->flags & LOOSE_VAR_KINDS) == 0) {
 				fprintf (stderr,
 					 "*** variable '%s' already "
 					 "added.\n", id->name);
 				return -1;
 			}
-			var = SYM2VAR(me->v.p);
+			var = SYM2VAR(sym);
 			oldkind = var->ex.kind;
 			var->ex.kind = kind; /* change kind */
 		} else {
@@ -4824,7 +4840,7 @@ saveIt (SHULLIVAN * shul, ITEM * item, int verbose)
 	    fileItem->it.itype != IT_IDENT) {
 saveSyntax:
 		fprintf (stderr,
-			 "*** Expected 'save (FILENAME [START_HISTNUM])'\n");
+			 "*** Expected '[i]save (FILENAME [START_HISTNUM])'\n");
 		return -1;
 	}
 	if ((numItem = fileItem->it.next) != NULL) {
@@ -4973,10 +4989,11 @@ erase (SHULLIVAN * shul, ITEM * item)
 
 	if (item->it.itype != IT_IDENT) {
 eraseSyntax:
-		fprintf (stderr, "*** Expected 'erase HISTORY_ITEM_NUMBER'\n");
+		fprintf (stderr,
+			 "*** Expected 'erase HISTORY_ITEM_NUMBER'\n");
 		if (shul->histlen != 0)
-			fprintf (stderr, "History item numbers : 0 <= n < %lu",
-				 shul->histlen);
+			fprintf (stderr, "History item numbers : "
+				 "0 <= n < %lu\n", shul->histlen);
 		else
 			fprintf (stderr, "There are no history items.\n");
 		return -1;
@@ -5250,12 +5267,12 @@ tipShow (FILE * f, TIP * tip, unsigned long verbose)
 			fprintf (f, "\n");
 		}
 	}
-	if (tip->mvs.count == 0)
+	if (tip->wvs.count == 0)
 		fprintf (f, "MV stack empty.\n");
 	else {
-		for (i = 0; i < tip->mvs.count; ++i) {
+		for (i = 0; i < tip->wvs.count; ++i) {
 			indent = fprintf (f, "MV%-3d ", i);
-			exprPrint (f, tip->mvs.exprs[i], verbose, indent);
+			exprPrint (f, tip->wvs.exprs[i], verbose, indent);
 			fprintf (f, "\n");
 		}
 	}
@@ -5385,7 +5402,7 @@ proofHold (THEOREM * thm, int allvars, VMAP * vmap, SHULLIVAN * shul)
 	 * not in the hypotheses or conclusions.
 	 */
 
-	nvars = thm->stmt->nMand + thm->stmt->nhvars;
+	nvars = thm->stmt->nWild + thm->stmt->nhvars;
 
 	size += sizeof (EXPR_VARINFO) * (allvars - nvars);
 
@@ -5396,8 +5413,8 @@ proofHold (THEOREM * thm, int allvars, VMAP * vmap, SHULLIVAN * shul)
 	pMem = (char *)s;
 	pMem += sizeof (PROOF_STEP) * thm->nSteps;
 
-	vmap += thm->stmt->nMand; /* skip over vMap entries corresponding to
-				     mandatory variables */
+	vmap += thm->stmt->nWild; /* skip over vMap entries corresponding to
+				     wild variables */
 
 	vi = (EXPR_VARINFO *)pMem; /* This is where the EXPR_VARINFO's for
 				      variables in the proof steps but not in
@@ -5505,7 +5522,7 @@ load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
 	arenaInit (&tip.arena, 0x10000, 0x2000000, &shul->backing);
 
 	exprStackInit (&tip.ps, &tip.arena);	/* proof stack */
-	exprStackInit (&tip.mvs, &tip.arena);	/* mand. var. stack */
+	exprStackInit (&tip.wvs, &tip.arena);	/* mand. var. stack */
 
 	if ((thm->steps = arenaAlloc (&tip.arena,
 				      i * sizeof (PROOF_STEP) + 1)) == NULL) {
@@ -5602,6 +5619,17 @@ load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
 
 checkstep:
 		if (proofStepApply (shul, &tip, step) != 0) {
+			if (step->ref.s.type == STEPT_REF) {
+				int verbose = PRINT_VERBOSE;
+				if (shul->verbose & 
+				    SHUL_VERB_PRINT_PRETTY)
+					verbose |= PRINT_PRETTY;
+				fprintf (stderr, "Failed applying:\n");
+				
+				statementPrint (stderr, 
+						step->ref.stat,
+						verbose);
+			}
 			proofNbhdPrint (sctx.proofStepItem,
 					tip.step, thm->nSteps);
 			goto load_thm_bad3;
@@ -5615,9 +5643,9 @@ checkstep:
 	 * definitions occurring in the conclusions).
 	 */
 
-	if (tip.mvs.count != 0) {
+	if (tip.wvs.count != 0) {
 		fprintf (stderr,
-			 "*** Mandatory variable stack must be empty "
+			 "*** Wild variable stack must be empty "
 			 "at end of proof.\n");
 		goto load_thm_bad3;
 	}
@@ -6603,7 +6631,7 @@ main (int argc, char * argv [])
 			}
 			break;
 		case 'v':
-			shul.verbose = atoi (optarg);
+			shul.verbose = strtoul (optarg, NULL, 0);
 			break;
 		case 'V':
 			printf ("Shullivan version %s\n", 
