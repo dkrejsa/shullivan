@@ -14,6 +14,9 @@
 
 #include "shullivan.h"
 
+#define ALLOC_ERR() \
+    fprintf (stderr, "Allocation error (%s, line %d)\n", __FILE__, __LINE__)
+
 typedef struct _GROWBUF {
 	void * buf;
 	size_t size;
@@ -163,11 +166,13 @@ typedef struct _SHULLIVAN {
 
 	unsigned long flags;
 
-#define MULTIPLE_CONCLUSIONS 1		/* Allow 0 or more conclusions */
-#define LOOSE_VAR_KINDS	2		/* allow variable kind inferrence */
-#define EXPORT_LOOSE_VAR_KINDS 4	/* var kind inference in export */
-#define EXPORT_WARN_DV 8		/* Warn of unneeded DVs in export */
-#define REQ_MULT_CONC_SYNTAX 16		/* Multiple conclusion syntax req'd. */
+#define MULTIPLE_CONCLUSIONS	1	/* Allow 0 or more conclusions */
+#define LOOSE_VAR_KINDS		2	/* allow variable kind inferrence */
+#define EXPORT_LOOSE_VAR_KINDS	4	/* var kind inference in export */
+#define EXPORT_WARN_DV		8	/* Warn of unneeded DVs in export */
+#define REQ_MULT_CONC_SYNTAX	16	/* Multiple conclusion syntax req'd. */
+#define DEF_JUSTIFY		32	/* Require justification proof for
+					   definitions with dummy variables. */
 } SHULLIVAN;
 
 typedef int (*COMMAND_FUNC) (SHULLIVAN * shul, ITEM * item);
@@ -323,7 +328,7 @@ exprStackPush (EXPR_STACK * s, EXPR * e)
 		nexpr = arenaAlloc (s->arena, 
 				    s->maxsize * sizeof (EXPR *));
 		if (nexpr == NULL) {
-			perror ("exprStackPush:arenaAlloc");
+			ALLOC_ERR ();
 			return -1;
 		}
 		memcpy (nexpr, expr, s->count * sizeof (EXPR *));
@@ -359,7 +364,7 @@ specialize (EXPR * e, EXPR ** env, ARENA * arena)
 	sexpr = arenaAlloc (arena,
 			    offsetof (S_EXPR, args) + arity * sizeof (EXPR *));
 	if (sexpr == NULL) {
-		perror ("specialize:arenaAlloc");
+		ALLOC_ERR ();
 		return NULL;
 	}
 
@@ -512,7 +517,7 @@ findVars (EXPR * e, MAPPING * m)
 
 		me = mapElemInsert (e, m);
 		if (me == NULL) {
-			perror ("findVars:mapElemInsert");
+			ALLOC_ERR ();
 			return -1;
 		}
 		/* Don't care about me->v, we're just using this as a set */
@@ -800,7 +805,7 @@ proofStepApply (SHULLIVAN * shul, TIP * tip, PROOF_STEP * s)
 		 * warning is generated.
 		 */
 		if (shul->verbose & SHUL_VERB_PRFWILD) {
-			j = printf ("M  ");
+			j = printf ("W  ");
 			exprPrint (stdout, s->expr.x, shul->verbose, j);
 			printf ("\n");
 		}
@@ -979,6 +984,31 @@ scannerInit (SCANNER * scan,
 	scan->cleanup = cleanup;
 	scan->gb.buf = NULL;
 	scan->gb.size = 0;
+}
+
+#define SIMPLE_SCAN_LINE_LEN	4096
+
+static char *
+simpleScan (SCANNER * scan, void * ctx)
+{
+	char * line;
+	char * prompt = (char *)ctx;
+
+	line = malloc (SIMPLE_SCAN_LINE_LEN);
+	if (line == NULL) {
+		perror ("simpleScan:malloc");
+		return NULL;
+	}
+
+	if (prompt) {
+		fprintf (stdout, "%s", prompt);
+		fflush (stdout);
+	}
+
+	if (fgets (line, SIMPLE_SCAN_LINE_LEN, stdin) == NULL)
+		return NULL;
+
+	return line;
 }
 
 static char *
@@ -1261,7 +1291,7 @@ sexpr_print (FILE * f, ITEM * item)
 	item = item->sl.first;
 	spacer = "";
 	while (item != NULL) {
-		fprintf (f, spacer);
+		fprintf (f, "%s", spacer);
 		sexpr_print (f, item);
 		spacer = " ";
 		item = item->it.next;
@@ -1846,6 +1876,7 @@ typedef struct _IMPORT_CONTEXT {
 	int exportFail;		/* Indicates export failure (e.g. on missing
 				   statement) but can continue the export */
 	int keephist;		/* keep history */
+	int def_just;		/* 1 for def_just, 0 for stmt */
 } IMPORT_CONTEXT;
 
 typedef int (*IMPORT_CMD_FUNC) (SHULLIVAN * shul, 
@@ -1900,7 +1931,7 @@ exprParse1 (ITEM * exp, EXPR_PARSE_CONTEXT * pctx, KIND * kindKnown)
 
 		me = mapElemInsert (exp->id.id, pctx->varIndex);
 		if (me == NULL) {
-			perror ("exprParse1:mapElemInsert");
+			ALLOC_ERR ();
 			return -1;
 		}
 
@@ -2107,12 +2138,33 @@ varIndexRemap (void * ctx, MAP_ELEM * me)
 	return NULL;
 }
 
+/*
+ * Initialize all of EXPR_PARSE_CONTEXT except for ec->terms and ec->syms.
+ */
+static void
+exprParseCtxInit (EXPR_PARSE_CONTEXT * ec, SHULLIVAN * shul)
+{
+	ec->vars = shul->vi.buf;
+	ec->varsSize = shul->vi.size / sizeof (EXPR_VARINFO);
+	ec->vargb = &shul->vi;
+	ec->nTermExps = 0;
+	ec->nDefExps = 0;
+	ec->nVarExps = 0;
+	ec->pMem = 0;
+
+	ec->varIndex = shul->varIndex;
+
+	assert (ec->varIndex->size == 0);
+	ec->varIndex->defval.i = -1; /* set default value */
+}
+
 typedef struct _STATEMENT_PARSE_CONTEXT {
 	EXPR_PARSE_CONTEXT ec;
 	INTERFACE * iface;
 	MAPPING * hypnams;
 	ITEM * proofStepItem; /* out, only if hypnams != NULL */
 	ITEM * hypItem;	      /* out, only if hypnams != NULL */
+	int def_just;	      /* true if it's a definition justification */
 } STATEMENT_PARSE_CONTEXT;
 
 /*
@@ -2145,6 +2197,8 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 	ITEM * concItem;
 	ITEM * proofItem;
 	ITEM * concStop;
+	ITEM * djv1Item = NULL; /* compiler warning */
+	ITEM * djv2Item;
 	IDENT * pid;
 	MAP_ELEM * me;
 	size_t size;
@@ -2160,11 +2214,52 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 	STATEMENT * stat;
 	char * pMem;
 	MAPPING * hypnams = ctx->hypnams;
+	VAR * djvar1;
+	VAR * djvar2;
 
 	if (arg->it.itype != IT_SLIST ||
 	    (nameItem = arg->sl.first) == NULL ||
-	    nameItem->it.itype != IT_IDENT ||
-	    (dvItem = nameItem->it.next) == NULL ||
+	    nameItem->it.itype != IT_IDENT)
+		goto parseStmtUsage;
+
+	if (ctx->def_just) {
+		SYMBOL * sym1;
+		SYMBOL * sym2;
+
+		if ((djv1Item = nameItem->it.next) == NULL ||
+		    djv1Item->it.itype != IT_IDENT ||
+		    (djv2Item = djv1Item->it.next) == NULL ||
+		    djv2Item->it.itype != IT_IDENT ||
+		    djv1Item->id.id == djv2Item->id.id ||
+		    (dvItem = djv2Item->it.next) == NULL ||
+		    dvItem->it.itype != IT_SLIST ||
+		    (hypItem = dvItem->it.next) == NULL ||
+		    hypItem->it.itype != IT_SLIST ||
+		    (concItem = hypItem->it.next) != NULL)
+			goto parseStmtUsage;
+
+		/* Check that both def-just vars exist as variables of
+		   the same kind. */
+
+		if ((sym1 = mapVal (djv1Item->id.id, ctx->ec.syms)) == NULL ||
+		    sym1->stype != ST_VAR ||
+		    (sym2 = mapVal (djv2Item->id.id, ctx->ec.syms)) == NULL ||
+		    sym2->stype != ST_VAR)
+			goto parseStmtUsage;
+		
+		djvar1 = SYM2VAR (sym1);
+		djvar2 = SYM2VAR (sym2);
+		if (djvar1->ex.kind->rep != djvar2->ex.kind->rep) {
+			fprintf (stderr, 
+				 "Kind mismatch for def_just variables %s, %s "
+				 "in %s\n", 
+				 djv1Item->id.id->name, djv2Item->id.id->name,
+				 nameItem->id.id->name);
+			return NULL;
+		}
+		proofItem = NULL; /* for compiler warning */
+
+	} else if ((dvItem = nameItem->it.next) == NULL ||
 	    dvItem->it.itype != IT_SLIST ||
 	    (hypItem = dvItem->it.next) == NULL ||
 	    hypItem->it.itype != IT_SLIST ||
@@ -2174,7 +2269,12 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 			 proofItem->it.itype != IT_SLIST ||
 			 proofItem->it.next != NULL))) {
 
-		if (hypnams)
+parseStmtUsage:
+		if (ctx->def_just)
+			fprintf (stderr, "*** expected def_just "
+				 "(NAME DJVAR1 DJVAR2 ([(VAR1 VAR2 ...)]) "
+				 "([(HYPNAME HYP) ...]))\n");
+		else if (hypnams)
 			fprintf (stderr,
 			   "*** expected thm (NAME ([(VAR1 VAR2 ...)]) "
 			   "([(HYPNAME HYP) ...]) "
@@ -2233,19 +2333,7 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 	 * ctx->ec.terms and ctx->ec.syms are set by the caller,
 	 * we initialize the rest of ctx->ec.
 	 */
-
-	ctx->ec.vars = shul->vi.buf;
-	ctx->ec.varsSize = shul->vi.size / sizeof (EXPR_VARINFO);
-	ctx->ec.vargb = &shul->vi;
-	ctx->ec.nTermExps = 0;
-	ctx->ec.nDefExps = 0;
-	ctx->ec.nVarExps = 0;
-	ctx->ec.pMem = 0;
-
-	ctx->ec.varIndex = shul->varIndex;
-
-	assert (ctx->ec.varIndex->size == 0);
-	ctx->ec.varIndex->defval.i = -1; /* set default value */
+	exprParseCtxInit (&ctx->ec, shul);
 
 	nhyps = 0;
 	for (item = hypItem->sl.first;
@@ -2266,7 +2354,7 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 			me = mapElemInsert (hypnamItem->id.id,
 					    hypnams);
 			if (me == NULL) {
-				perror ("parseStatement:mapElemInsert");
+				ALLOC_ERR ();
 				goto parseStatement_bad2;
 			}
 			if (me->v.i != -1) {
@@ -2281,6 +2369,15 @@ parseStatement (SHULLIVAN * shul, ITEM * arg,
 		if (exprParse1 (item2, &ctx->ec, NULL) != 0)
 			goto parseStatement_bad2;
 		++nhyps;
+	}
+
+	nWild = ctx->ec.varIndex->size; /* fix up later */
+
+	/* Definition justification case: 2 'conclusions' */
+	if (djv1Item != NULL) {
+		concItem = djv1Item;
+		concStop = dvItem;
+		goto parseStatement_do_concs;
 	}
 
 	/* Check for old 1-conclusion syntax */
@@ -2332,9 +2429,9 @@ oldConcSyntax:
 		concItem = item;
 	}
 
-	nWild = ctx->ec.varIndex->size; /* fix up later */
-
 	/* process the conclusions */
+
+parseStatement_do_concs:
 
 	nconcs = 0;
 	for (item = concItem; item != concStop; item = item->it.next) {
@@ -2392,7 +2489,7 @@ oldConcSyntax:
 		goto parseStatement_bad2;
 	}
 
-	stat->sym.stype = ST_STMT;
+	stat->sym.stype = ctx->def_just ? ST_DEFJUST : ST_STMT;
 	stat->sym.ident = pid;
 	stat->nHyps = nhyps;
 	stat->nCons= nconcs;
@@ -2671,7 +2768,7 @@ exprCheck (ITEM * item, EXPR * exp, EXPR_PARSE_CONTEXT * ctx, KIND * knownKind)
 
 		me = mapElemInsert (id, ctx->varIndex);
 		if (me == NULL) {
-			perror ("exprCheck:mapElemInsert");
+			ALLOC_ERR ();
 			return -1;
 		}
 		if (me->v.i != -1) {
@@ -2767,6 +2864,7 @@ import_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ctx)
 	sctx.ec.syms = ctx->localSyms;
 	sctx.iface = ctx->iface;
 	sctx.hypnams = NULL; /* no hypothesis names for a 'stmt' */
+	sctx.def_just = 0;
 
 	stat = parseStatement (shul, arg, &sctx);
 	if (stat == NULL)
@@ -2776,7 +2874,49 @@ import_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ctx)
 
 	me = mapElemInsert (stat->sym.ident, shul->syms);
 	if (me == NULL) {
-		perror ("import_stmt:mapElemInsert");
+		ALLOC_ERR ();
+		statementFree (stat);
+		return -1;
+	}
+
+	/*
+	 * parseStatement() checked that there was no existing
+	 * statement of the same name.
+	 */
+	assert (me->v.p == (void *)NULL);
+
+	me->v.p = stat;
+
+	return 0;
+}
+
+static int
+import_def_just (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ctx)
+{
+	STATEMENT * stat;
+	STATEMENT_PARSE_CONTEXT sctx;
+	MAP_ELEM * me;
+
+	if ((shul->flags & DEF_JUSTIFY) == 0) {
+		fprintf (stderr, "'def_just' is not allowed unless the "
+			 "DEF_JUSTIFY flag is enabled.\n");
+		return -1;
+	}
+	sctx.ec.terms = ctx->localTerms;
+	sctx.ec.syms = ctx->localSyms;
+	sctx.iface = ctx->iface;
+	sctx.hypnams = NULL; /* no hypothesis names for a 'def_just' */
+	sctx.def_just = 1;
+
+	stat = parseStatement (shul, arg, &sctx);
+	if (stat == NULL)
+		return -1;
+
+	mappingEmpty (sctx.ec.varIndex, NULL, NULL);
+
+	me = mapElemInsert (stat->sym.ident, shul->syms);
+	if (me == NULL) {
+		ALLOC_ERR ();
 		statementFree (stat);
 		return -1;
 	}
@@ -2819,6 +2959,9 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 	ITEM * hypItem;
 	ITEM * item;
 	ITEM * concItem;
+	ITEM * concStop;
+	ITEM * djv1Item = NULL;
+	ITEM * djv2Item;
 	IDENT * pid;
 	int nvars;
 	TERM * term;
@@ -2830,6 +2973,8 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 	int cycle;
 	DVWORK * dvw = NULL; /* avoid compiler warning */
 	unsigned long warndv;
+	VAR * djvar1;
+	VAR * djvar2;
 
 	ctx.ec.terms = ictx->localTerms;
 	ctx.ec.syms = ictx->localSyms;
@@ -2837,16 +2982,51 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 
 	if (arg->it.itype != IT_SLIST ||
 	    (nameItem = arg->sl.first) == NULL ||
-	    nameItem->it.itype != IT_IDENT ||
-	    (dvItem = nameItem->it.next) == NULL ||
-	    dvItem->it.itype != IT_SLIST ||
-	    (hypItem = dvItem->it.next) == NULL ||
-	    hypItem->it.itype != IT_SLIST ||
-	    (concItem = hypItem->it.next) == NULL ||
-	    concItem->it.next != NULL) {
-		fprintf (stderr,
-			 "*** expected stmt (NAME ([(VAR1 VAR2 ...)]) "
-			 "([HYP ...]) {CONCL | ([CONCL ...])})\n");
+	    nameItem->it.itype != IT_IDENT)
+		goto export_stmt_usage;
+
+	if (ictx->def_just) {
+		SYMBOL * sym1;
+		SYMBOL * sym2;
+
+		if ((djv1Item = nameItem->it.next) == NULL ||
+		    djv1Item->it.itype != IT_IDENT ||
+		    (djv2Item = djv1Item->it.next) == NULL ||
+		    djv2Item->it.itype != IT_IDENT ||
+		    djv1Item->id.id == djv2Item->id.id ||
+		    (dvItem = djv2Item->it.next) == NULL ||
+		    dvItem->it.itype != IT_SLIST ||
+		    (hypItem = dvItem->it.next) == NULL ||
+		    hypItem->it.itype != IT_SLIST ||
+		    (concItem = hypItem->it.next) != NULL)
+			goto export_stmt_usage;
+
+		if ((sym1 = mapVal (djv1Item->id.id, ctx.ec.syms)) == NULL ||
+		    sym1->stype != ST_VAR ||
+		    (sym2 = mapVal (djv2Item->id.id, ctx.ec.syms)) == NULL ||
+		    sym2->stype != ST_VAR)
+			goto export_stmt_usage;
+		
+		djvar1 = SYM2VAR (sym1);
+		djvar2 = SYM2VAR (sym2);
+		concItem = djv1Item;
+		concStop = dvItem;
+
+	} else if ((dvItem = nameItem->it.next) == NULL ||
+		   dvItem->it.itype != IT_SLIST ||
+		   (hypItem = dvItem->it.next) == NULL ||
+		   hypItem->it.itype != IT_SLIST ||
+		   (concItem = hypItem->it.next) == NULL ||
+		   (concStop = concItem->it.next) != NULL) {
+export_stmt_usage:
+		if (ictx->def_just)
+			fprintf (stderr,
+				 "*** expected def_just "
+				 "(NAME ([(VAR1 VAR2 ...)]) ([HYP ...]))\n");
+		else
+			fprintf (stderr,
+				 "*** expected stmt (NAME ([(VAR1 VAR2 ...)]) "
+				 "([HYP ...]) {CONCL | ([CONCL ...])})\n");
 		return -1;
 	}
 
@@ -2854,19 +3034,14 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 			     ctx.iface->pfxlen,
 			     nameItem->id.id);
 	if (pid == NULL) {
-		perror ("export_stmt:identPrefixed");
+		ALLOC_ERR ();
 		return -1;
 	}
 
-	/* 
-	 * Note, we don't insert the theorem symbol yet, so that
-	 * it can't be used in its own proof (or partially 
-	 * initialized in its own definition, for a 'stmt').
-	 */
-
 	stat = mapVal (pid, shul->syms);
 
-	if (stat == NULL || stat->sym.stype != ST_STMT) {
+	if (stat == NULL || 
+	    stat->sym.stype != (djv1Item ? ST_DEFJUST : ST_STMT)) {
 		fprintf (stderr, "*** statement '%s' does not exist.\n",
 			 pid->name);
 		identFree (pid);
@@ -2892,6 +3067,9 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 			 stat->sym.ident->name, stat->nHyps, i);
 		return -1;
 	}
+
+	if (djv1Item != NULL)
+		goto export_stmt_haveconcs;
 
 	/* Check for old 1-conclusion syntax */
 
@@ -2942,6 +3120,7 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 		return -1;
 	}
 
+export_stmt_haveconcs:
 
 	/*
 	 * ctx.ec.terms and ctx.ec.syms are set by the caller,
@@ -3003,7 +3182,7 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 	/* process the conclusions */
 
 	i = 0;
-	for (item = concItem; item != NULL; item = item->it.next) {
+	for (item = concItem; item != concStop; item = item->it.next) {
 		if (exprCheck (item, stat->cons[i], &ctx.ec, NULL) != 0)
 			goto export_stmt_bad;
 		++i;
@@ -3030,6 +3209,8 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 	 * have received their kinds not by inference from terms but by
 	 * default from the kind of the named local variable. (This can
 	 * occur regardless of whether loose variable kinds are allowed.)
+	 * (Note, this also checks the kinds of the def_just vars for
+	 * def_just commands.)
 	 */
 
 	for (i = 0; i < nvars; ++i) {
@@ -3054,7 +3235,7 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 		dvsize = BIT_MAP_SIZE(pairs);
 		dvbits = calloc (1, dvsize);
 		if (dvbits == NULL) {
-			perror ("export_stmt:calloc");
+			ALLOC_ERR ();
 			goto export_stmt_bad;
 		}
 		shul->dvsize = dvsize;
@@ -3096,7 +3277,7 @@ export_stmt (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
 			}
 			if (j * sizeof (DVWORK) > shul->dvw.size &&
 			    growBuf (&shul->dvw, j * sizeof (DVWORK)) != 0) {
-				perror ("export_stmt:growBuf");
+				ALLOC_ERR ();
 				goto export_stmt_bad;
 			}
 			dvw = shul->dvw.buf;
@@ -3188,6 +3369,27 @@ export_stmt_bad:
 	mappingEmpty (ctx.ec.varIndex, NULL, NULL);
 
 	return -1;
+}
+
+static int
+export_def_just (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ictx)
+{
+	int result;
+	if ((shul->flags & DEF_JUSTIFY) == 0) {
+		fprintf (stderr, 
+			 "*** def_just encountered in export but "
+			 "DEF_JUSTIFY option is not enabled.\n");
+#if 0
+		return -1;
+#else
+		ictx->exportFail = 1;
+		return 0;
+#endif
+	}
+	ictx->def_just = 1;
+	result = export_stmt (shul, arg, ictx);
+	ictx->def_just = 0; /* restore usual value -- ugh */
+	return result;
 }
 
 #define VAR_CHUNK 64
@@ -3282,7 +3484,7 @@ import_var_format:
 
 		me = mapElemInsert (id, ctx->localSyms);
 		if (me == NULL) {
-			perror ("import_var:mapElemInsert");
+			ALLOC_ERR ();
 			varFree (var);
 			return -1;
 		}
@@ -3422,7 +3624,7 @@ import_term_format:
 
 			me = mapElemInsert (pid, shul->terms);
 			if (me == NULL) {
-				perror ("import_term:mapElemInsert");
+				ALLOC_ERR ();
 				goto import_term_bad2;
 			}
 			/* must be new, we checked earlier */
@@ -3478,7 +3680,7 @@ import_term_format:
 
 		me = mapElemInsert (termIdItem->id.id, ctx->localTerms);
 		if (me == NULL) {
-			perror ("import_term:mapElemInsert[1]");
+			ALLOC_ERR ();
 			if (ctx->importing)
 				goto import_term_bad3;
 			return -1; /* already freed pid */
@@ -3502,7 +3704,7 @@ import_term_format:
 		 */
 		me = mapElemInsert (termIdItem->id.id, iface->terms);
 		if (me == NULL) {
-			perror ("import_term:mapElemInsert[2]");
+			ALLOC_ERR ();
 			if (ctx->importing)
 				goto import_term_bad3;
 			return -1; /* already freed pid */
@@ -3566,7 +3768,7 @@ import_kind (SHULLIVAN * shul, ITEM * arg, IMPORT_CONTEXT * ctx)
 
 			me = mapElemInsert (pid, shul->kinds);
 			if (me == NULL) {
-				perror ("import_kind:mapElemInsert");
+				ALLOC_ERR ();
 				goto import_kind_bad2;
 			}
 			if (me->v.p != NULL) {
@@ -3734,7 +3936,7 @@ kindAdopt (void * arg, MAP_ELEM * me)
 	kme = mapElemInsert (pid, ctx->localKinds);
 	if (kme == NULL) {
 		(void)identFree (pid);
-		perror ("kindAdopt:memElemInsert");
+		ALLOC_ERR ();
 		return me; /* fail */
 	}
 
@@ -3769,7 +3971,7 @@ termAdopt (void * arg, MAP_ELEM * me)
 	tme = mapElemInsert (pid, ctx->localTerms);
 	if (tme == NULL) {
 		(void)identFree (pid);
-		perror ("termAdopt:memElemInsert");
+		ALLOC_ERR ();
 		return me; /* fail */
 	}
 
@@ -3988,6 +4190,8 @@ importFindFunc (char * cmd)
 		cmdFunc = import_kindbind;
 	else if (strcmp (cmd, "param") == 0)
 		cmdFunc = import_param;
+	else if (strcmp (cmd, "def_just") == 0) /* only if DEF_JUSTIFY ? */
+		cmdFunc = import_def_just;
 	else {
 		cmdFunc = NULL;
 	}
@@ -4011,6 +4215,8 @@ exportFindFunc (char * cmd)
 		cmdFunc = import_kindbind;
 	else if (strcmp (cmd, "param") == 0)
 		cmdFunc = import_param;
+	else if (strcmp (cmd, "def_just") == 0)
+		cmdFunc = export_def_just;
 	else {
 		cmdFunc = NULL;
 	}
@@ -4108,7 +4314,7 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 
 	me = mapElemInsert (nameItem->id.id, shul->interfaces);
 	if (me == NULL) {
-		perror ("port:mapElemInsert");
+		ALLOC_ERR ();
 		goto port_bad;
 	}
 
@@ -4165,6 +4371,7 @@ port (SHULLIVAN * shul, ITEM * args, int importing)
 	ctx.importing = importing;
 	ctx.exportFail = 0;
 	ctx.keephist = 0;
+	ctx.def_just = 0;
 
 	param = paramsItem->sl.first;
 	nparams = 0;
@@ -4326,7 +4533,8 @@ ifaceFree (SHULLIVAN * shul, INTERFACE * iface)
 		MAP_ELEM_ITER_SAFE (shul->syms, me, nextme) {
 			sym = me->v.p;
 			assert (sym != NULL);
-			if (sym->stype == ST_STMT &&
+			if ((sym->stype == ST_STMT || 
+			     sym->stype == ST_DEFJUST) &&
 			    ((STATEMENT *)sym)->iface == iface) {
 				id = me->obj;
 				(void)mapElemDelete (me->obj, shul->syms);
@@ -4460,7 +4668,7 @@ kindClassCollect (void * ctx, MAP_ELEM * me)
 
 	classme = mapElemInsert (kind->rep, classes);
 	if (classme == NULL) {
-		perror ("kindClassCollect:mapElemInsert");
+		ALLOC_ERR ();
 		return me; /* stop the walk */
 	}
 	class = classme->v.p;
@@ -4468,14 +4676,14 @@ kindClassCollect (void * ctx, MAP_ELEM * me)
 		/* new class */
 		class = mappingCreate (NULL);
 		if (class == NULL) {
-			perror ("kindClassCollect:mappingCreate");
+			ALLOC_ERR ();
 			return me;
 		}
 		classme->v.p = class;
 	}
 
 	if (mapElemInsert (kind, class) == NULL) {
-		perror ("kindClassCollect:mapElemInsert[2]");
+		ALLOC_ERR ();
 		return me;
 	}
 	return NULL;
@@ -4493,7 +4701,7 @@ kindList (SHULLIVAN * shul, ITEM * ignored)
 	KIND * kind;
 
 	if ((classes = mappingCreate(NULL)) == NULL) {
-		perror ("kindList:mappingCreate");
+		ALLOC_ERR ();
 		return -1;
 	}
 	(void)mappingEnumerate (shul->kinds, kindClassCollect, classes);
@@ -4746,6 +4954,10 @@ flags (SHULLIVAN * shul, ITEM * sexpr)
 		printf ("0x%x : Require multiple conclusion syntax [%s]\n",
 			REQ_MULT_CONC_SYNTAX, 
 			(flg & REQ_MULT_CONC_SYNTAX) ? "On" : "Off");
+		printf ("0x%x : Definitions with dummies require "
+			"justification [%s]\n",
+			DEF_JUSTIFY, 
+			(flg & DEF_JUSTIFY) ? "On" : "Off");
 	}
 	return 0;
 }
@@ -5056,7 +5268,7 @@ exprParse3 (ITEM * item, EXPR_PARSE_CONTEXT * pctx, ARENA * arena)
 	if (item->it.itype == IT_IDENT) {
 		me = mapElemInsert (item->id.id, pctx->varIndex);
 		if (me == NULL) {
-			perror ("exprParse3:mapElemInsert");
+			ALLOC_ERR ();
 			return NULL;
 		}
 		if (me->v.p != NULL) {
@@ -5072,7 +5284,7 @@ exprParse3 (ITEM * item, EXPR_PARSE_CONTEXT * pctx, ARENA * arena)
 
 		vi = arenaAlloc (arena, sizeof (*vi));
 		if (vi == NULL) {
-			perror ("exprParse3:arenaAlloc[1]");
+			ALLOC_ERR ();
 			return NULL;
 		}
 		var = SYM2VAR (sym);
@@ -5108,7 +5320,7 @@ exprParse3 (ITEM * item, EXPR_PARSE_CONTEXT * pctx, ARENA * arena)
 	sexpr = arenaAlloc (arena, (offsetof (S_EXPR, args) + 
 				    term->arity * sizeof (EXPR *)));
 	if (sexpr == NULL) {
-		perror ("exprParse3:arenaAlloc");
+		ALLOC_ERR ();
 		return NULL;
 	}
 
@@ -5198,7 +5410,7 @@ checkConclusion (EXPR * pse, EXPR * scon, EXPR ** env, EXPR * deftgt,
 		 */
 		env = arenaAlloc (c->arena, n * sizeof (*env) + 1);
 		if (env == NULL) {
-			perror ("checkConclusion:arenaAlloc");
+			ALLOC_ERR ();
 			return -1;
 		}
 
@@ -5295,10 +5507,10 @@ tipShow (FILE * f, TIP * tip, unsigned long verbose)
 		}
 	}
 	if (tip->wvs.count == 0)
-		fprintf (f, "MV stack empty.\n");
+		fprintf (f, "WV stack empty.\n");
 	else {
 		for (i = 0; i < tip->wvs.count; ++i) {
-			indent = fprintf (f, "MV%-3d ", i);
+			indent = fprintf (f, "WV%-3d ", i);
 			exprPrint (f, tip->wvs.exprs[i], verbose, indent);
 			fprintf (f, "\n");
 		}
@@ -5471,14 +5683,16 @@ typedef struct _LOAD_CONTEXT {
 	int interactive;
 } LOAD_CONTEXT;
 
+/*
+ * Initialize *pTip, create a THEOREM, and check the proof steps.
+ * When stat is NULL, this is a definition justification proof.
+ */
 static int
-load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
+proof1 (SHULLIVAN * shul, STATEMENT_PARSE_CONTEXT * pSctx, TIP * pTip,
+	STATEMENT * stat)
 {
 	IDENT * id;
-	STATEMENT * stat;
-	STATEMENT_PARSE_CONTEXT sctx;
 	THEOREM * thm;
-	TIP tip;
 	ITEM * item;
 	ITEM * hypItem;
 	SYMBOL * sym;
@@ -5487,6 +5701,241 @@ load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
 	PROOF_STEP * step;
 	MAP_ELEM * me;
 	EXPR * ex;
+	EXPR_VARINFO * vi;
+	int nvars;
+	int djSeen = 0;
+
+	thm = malloc (offsetof (THEOREM, hypnam) +
+		      pSctx->hypnams->size * sizeof (IDENT *));
+
+	if (thm == NULL) {
+		perror ("proof1:malloc");
+		goto proof1_bad1;
+	}
+
+	thm->stmt = stat;
+
+	i = 0;
+	for (item = pSctx->hypItem; item != NULL; item = item->it.next) {
+		assert (item->it.itype == IT_SLIST);
+		hypItem = item->sl.first;
+		assert (hypItem != NULL && hypItem->it.itype == IT_IDENT);
+		thm->hypnam[i++] = hypItem->id.id;
+
+		/*
+		 * hypItem->id.id->refcount has already been incremented
+		 * when hypItem->id.id was added to pSctx->hypnams.
+		 */
+	}
+
+	i = 0; /* quick count of proof steps */
+	for (item = pSctx->proofStepItem; item != NULL;
+	     item = item->it.next)
+		++i;
+
+	thm->nSteps = i;
+	pTip->t = thm;
+	pTip->step = 0;
+	pTip->hypnams = pSctx->hypnams;
+	pTip->varIndex = pSctx->ec.varIndex;
+
+	nvars = pSctx->ec.varIndex->size;
+	
+	arenaInit (&pTip->arena, 0x10000, 0x2000000, &shul->backing);
+
+	exprStackInit (&pTip->ps, &pTip->arena);	/* proof stack */
+	exprStackInit (&pTip->wvs, &pTip->arena);	/* wild var. stack */
+
+	if ((thm->steps = arenaAlloc (&pTip->arena,
+				      i * sizeof (PROOF_STEP) + 1)) == NULL) {
+		ALLOC_ERR ();
+		goto proof1_bad2;
+	}
+
+
+	for (item = pSctx->proofStepItem; item != NULL;
+	     item = item->it.next, ++pTip->step) {
+
+		step = &thm->steps[pTip->step];
+#if 0
+		printf ("step %d: ", pTip->step);
+		sexpr_print (stdout, item);
+		printf ("\n");
+#endif
+		if (item->it.itype == IT_SLIST) {
+			step->expr.s.type = STEPT_EXPR;
+			step->expr.x = exprParse3 (item, &pSctx->ec, 
+						   &pTip->arena);
+			if (step->expr.x == NULL)
+				goto proof1_bad3;
+			
+			goto checkstep;
+		}
+
+		assert (item->it.itype == IT_IDENT);
+
+		id = item->id.id;
+
+		/* first check for hypothesis name */
+		i = mapValI (id, pTip->hypnams);
+		if (i != -1) {
+			step->hyp.s.type = STEPT_HYP;
+			step->hyp.index = i;
+
+			goto checkstep;
+		}
+
+		/* next check for a variable occurring in the
+		   hypotheses or conclusions (or one already seen) */
+
+		ex = mapVal (id, pTip->varIndex);
+		if (ex != NULL) {
+			step->expr.s.type = STEPT_EXPR;
+			step->expr.x = ex;
+			goto checkstep;
+		}
+
+		sym = mapVal (id, shul->syms);
+		if (sym == NULL) {
+			fprintf (stderr,
+				 "*** Unknown proof step '%s'\n",
+				 id->name);
+			goto proof1_bad3;
+		}
+
+		if (sym->stype == ST_VAR) {
+
+			me = mapElemInsert (id, pTip->varIndex);
+			if (me == NULL) {
+				ALLOC_ERR ();
+				goto proof1_bad3;
+			}
+
+			assert (me->v.p == NULL);
+
+			vi = arenaAlloc (&pTip->arena, sizeof (*vi));
+			if (vi == NULL) {
+				ALLOC_ERR ();
+				goto proof1_bad3;
+			}
+			me->v.p = vi;
+
+			/*
+			 * Do not increment reference count on id,
+			 * since both pTip->varIndex and the temporary variable
+			 * vi will go away when we exit the caller.
+			 */
+
+			var = SYM2VAR (sym);
+
+			vi->ex.etype = ET_IVAR;
+			vi->ex.kind = var->ex.kind;
+			vi->id = id;
+			vi->index = pTip->varIndex->size - 1;
+			step->expr.s.type = STEPT_EXPR;
+			step->expr.x = (EXPR *)vi;
+			goto checkstep;
+		}
+
+		if (sym->stype == ST_DEFJUST) {
+			/*
+			 * A definition justification step must occur only
+			 * as the last step in a definition justification
+			 * proof.
+			 */
+			if (stat != NULL) {
+				fprintf (stderr,
+					 "*** Definition justification rule "
+					 "%s used in non-definition proof.\n",
+					 id->name);
+				goto proof1_bad3;
+			}
+			if (item->it.next != NULL) {
+				fprintf (stderr,
+					 "*** Definition justification rule "
+					 "%s must be last step of proof.\n",
+					 id->name);
+				goto proof1_bad3;
+			}
+			djSeen = 1;
+		} else
+			assert (sym->stype == ST_STMT);
+
+		step->ref.s.type = STEPT_REF;
+		step->ref.stat = (STATEMENT *)sym;
+
+checkstep:
+		if (proofStepApply (shul, pTip, step) != 0) {
+			if (step->ref.s.type == STEPT_REF) {
+				int verbose = PRINT_VERBOSE;
+				if (shul->verbose & 
+				    SHUL_VERB_PRINT_PRETTY)
+					verbose |= PRINT_PRETTY;
+				fprintf (stderr, "*** Failed applying:\n");
+
+				statementPrint (stderr, 
+						step->ref.stat,
+						verbose);
+			}
+			proofNbhdPrint (pSctx->proofStepItem,
+					pTip->step, thm->nSteps);
+			goto proof1_bad3;
+		}
+	}
+
+	if ((stat == NULL) & !djSeen) {
+		fprintf (stderr,
+			 "A definition justification rule is needed as the "
+			 "last step of proof.\n");
+		goto proof1_bad3;
+	}
+
+	/*
+	 * OK, now we must verify that the WV stack is empty, and
+	 * what remains on the proof stack is just the conclusions
+	 * of the theorem (if necessary expanding and checking any
+	 * definitions occurring in the conclusions).
+	 */
+
+	if (pTip->wvs.count != 0) {
+		fprintf (stderr,
+			 "*** Wild variable stack must be empty "
+			 "at end of proof.\n");
+		goto proof1_bad3;
+	}
+
+	return 0;
+
+
+proof1_bad3:
+
+	memset (shul->dvbits, 0, shul->dvsize);
+
+	tipShow (stderr, pTip, shul->verbose);
+
+	arenaFree (&pTip->arena);
+
+proof1_bad2:
+	free (thm);
+	pTip->t = NULL;
+
+proof1_bad1:
+
+	mappingEmpty (pSctx->ec.varIndex, NULL, NULL);
+	/* caller must free stat */
+
+	return -1;
+}
+
+static int
+load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
+{
+	STATEMENT * stat;
+	STATEMENT_PARSE_CONTEXT sctx;
+	THEOREM * thm;
+	TIP tip;
+	int i;
+	MAP_ELEM * me;
 	EXPR_VARINFO * vi;
 	int nvars;
 	int allvars;
@@ -5499,183 +5948,26 @@ load_thm (SHULLIVAN * shul, ITEM * arg, void * ctx)
 	sctx.ec.syms = shul->syms;
 	sctx.iface = NULL;
 	if ((sctx.hypnams = mappingCreate (NULL)) == NULL) {
-		perror ("load_thm:mappingCreate");
+		ALLOC_ERR ();
 		return -1;
 	}
 
 	sctx.hypnams->defval.i = -1;
+	sctx.def_just = 0;
 
 	stat = parseStatement (shul, arg, &sctx);
 	if (stat == NULL)
 		goto load_thm_bad0;  /* hypnams has been cleaned up for us */
 
-	thm = malloc (offsetof (THEOREM, hypnam) +
-		      sctx.hypnams->size * sizeof (IDENT *));
-
-	if (thm == NULL) {
-		perror ("load_thm:malloc");
-		goto load_thm_bad1;
-	}
-
-	thm->stmt = stat; /* We'll link stat to thm if we keep the proof */
-
-	i = 0;
-	for (item = sctx.hypItem; item != NULL; item = item->it.next) {
-		assert (item->it.itype == IT_SLIST);
-		hypItem = item->sl.first;
-		assert (hypItem != NULL && hypItem->it.itype == IT_IDENT);
-		thm->hypnam[i++] = hypItem->id.id;
-
-		/*
-		 * hypItem->id.id->refcount has already been incremented
-		 * when hypItem->id.id was added to sctx.hypnams.
-		 */
-	}
-
-	i = 0; /* quick count of proof steps */
-	for (item = sctx.proofStepItem; item != NULL;
-	     item = item->it.next)
-		++i;
-
-	thm->nSteps = i;
-	tip.t = thm;
-	tip.s = thm->stmt;
-	tip.step = 0;
-	tip.hypnams = sctx.hypnams;
-	tip.varIndex = sctx.ec.varIndex;
-
 	nvars = sctx.ec.varIndex->size;
-	
-	arenaInit (&tip.arena, 0x10000, 0x2000000, &shul->backing);
 
-	exprStackInit (&tip.ps, &tip.arena);	/* proof stack */
-	exprStackInit (&tip.wvs, &tip.arena);	/* mand. var. stack */
-
-	if ((thm->steps = arenaAlloc (&tip.arena,
-				      i * sizeof (PROOF_STEP) + 1)) == NULL) {
-		perror ("load_thm:arenaAlloc[1]");
+	thm = NULL;
+	/* Initialize tip, validate proof steps */
+	if (proof1 (shul, &sctx, &tip, stat) != 0) {
 		goto load_thm_bad2;
 	}
 
-
-	for (item = sctx.proofStepItem; item != NULL;
-	     item = item->it.next, ++tip.step) {
-
-		step = &thm->steps[tip.step];
-#if 0
-		printf ("step %d: ", tip.step);
-		sexpr_print (stdout, item);
-		printf ("\n");
-#endif
-		if (item->it.itype == IT_SLIST) {
-			step->expr.s.type = STEPT_EXPR;
-			step->expr.x = exprParse3 (item, &sctx.ec, &tip.arena);
-			if (step->expr.x == NULL)
-				goto load_thm_bad3;
-			
-			goto checkstep;
-		}
-
-		assert (item->it.itype == IT_IDENT);
-
-		id = item->id.id;
-
-		/* first check for hypothesis name */
-		i = mapValI (id, tip.hypnams);
-		if (i != -1) {
-			step->hyp.s.type = STEPT_HYP;
-			step->hyp.index = i;
-
-			goto checkstep;
-		}
-
-		/* next check for a variable occurring in the
-		   hypotheses or conclusions (or one already seen) */
-
-		ex = mapVal (id, tip.varIndex);
-		if (ex != NULL) {
-			step->expr.s.type = STEPT_EXPR;
-			step->expr.x = ex;
-			goto checkstep;
-		}
-
-		sym = mapVal (id, shul->syms);
-		if (sym == NULL) {
-			fprintf (stderr,
-				 "*** Unknown proof step '%s'\n",
-				 id->name);
-			goto load_thm_bad3;
-		}
-
-		if (sym->stype == ST_VAR) {
-
-			me = mapElemInsert (id, tip.varIndex);
-			if (me == NULL) {
-				perror ("load_thm:mapElemInsert[1]");
-				goto load_thm_bad3;
-			}
-			assert (me->v.p == NULL);
-			vi = arenaAlloc (&tip.arena, sizeof (*vi));
-			if (vi == NULL) {
-				perror ("load_thm:arenaAlloc");
-				goto load_thm_bad3;
-			}
-			me->v.p = vi;
-
-			/*
-			 * Do not increment reference count on id,
-			 * since both tip.varIndex and the temporary variable
-			 * vi will go away when we exit load_thm().
-			 */
-
-			var = SYM2VAR (sym);
-
-			vi->ex.etype = ET_IVAR;
-			vi->ex.kind = var->ex.kind;
-			vi->id = id;
-			vi->index = tip.varIndex->size - 1;
-			step->expr.s.type = STEPT_EXPR;
-			step->expr.x = (EXPR *)vi;
-			goto checkstep;
-		}
-
-		assert (sym->stype == ST_STMT);
-
-		step->ref.s.type = STEPT_REF;
-		step->ref.stat = (STATEMENT *)sym;
-
-checkstep:
-		if (proofStepApply (shul, &tip, step) != 0) {
-			if (step->ref.s.type == STEPT_REF) {
-				int verbose = PRINT_VERBOSE;
-				if (shul->verbose & 
-				    SHUL_VERB_PRINT_PRETTY)
-					verbose |= PRINT_PRETTY;
-				fprintf (stderr, "Failed applying:\n");
-
-				statementPrint (stderr, 
-						step->ref.stat,
-						verbose);
-			}
-			proofNbhdPrint (sctx.proofStepItem,
-					tip.step, thm->nSteps);
-			goto load_thm_bad3;
-		}
-	}
-
-	/*
-	 * OK, now we must verify that the MV stack is empty, and
-	 * what remains on the proof stack is just the conclusions
-	 * of the theorem (if necessary expanding and checking any
-	 * definitions occurring in the conclusions).
-	 */
-
-	if (tip.wvs.count != 0) {
-		fprintf (stderr,
-			 "*** Wild variable stack must be empty "
-			 "at end of proof.\n");
-		goto load_thm_bad3;
-	}
+	thm = tip.t;
 
 	if (tip.ps.count != stat->nCons) {
 		/*
@@ -5707,7 +5999,7 @@ checkstep:
 	 */
 	vmap = arenaAlloc (&tip.arena, (allvars - i) * sizeof (*vmap) + 1);
 	if (vmap == NULL) {
-		perror ("load_thm:arenaAlloc");
+		ALLOC_ERR ();
 		goto load_thm_bad3;
 	}
 
@@ -5757,7 +6049,10 @@ checkstep:
 	 * 2. If a DV pair occurs involving a remnant variable bound to
 	 *    a definition dummy, the other variable of the pair must belong
 	 *    to the subexpression matched against the def expansion which
-	 *    bound the def dummy to the first variable. (Huh?)
+	 *    bound the def dummy to the first variable. Definition dummies
+	 *    may be considered implicitly distinct, but only with respect
+	 *    to other variables occurring in the (substituted) definition
+	 *    RHS.
 	 */
 
 	dv.dvbits = stat->dvbits;
@@ -5785,7 +6080,7 @@ checkstep:
 
 	me = mapElemInsert (stat->sym.ident, shul->syms);
 	if (me == NULL) {
-		perror ("load_thm:mapElemInsert");
+		ALLOC_ERR ();
 		goto load_thm_bad3;
 	}
 	/*
@@ -5832,12 +6127,11 @@ load_thm_bad3:
 
 	arenaFree (&tip.arena);
 
-load_thm_bad2:
 	free (thm);
 
-load_thm_bad1:
-
 	mappingEmpty (sctx.ec.varIndex, NULL, NULL);
+
+load_thm_bad2:
 	statementFree (stat);
 
 load_thm_bad0:
@@ -5862,12 +6156,223 @@ load_var (SHULLIVAN * shul, ITEM * arg, void * ctx)
 	return import_var (shul, arg, &lc->ic);
 }
 
+typedef struct _INT_PAIR
+{
+	int i1, i2;
+} INT_PAIR;
+
+static int
+djParse (ITEM * rhsItem, EXPR * e1, EXPR * e2, 
+	 TIP * tip, int nvars, int dummies, MAPPING * dmap, MAPPING * rmap)
+{
+	MAP_ELEM * me;
+	MAP_ELEM * me1;
+	MAP_ELEM * me2;
+	EXPR * ex;
+	int ix;
+	int i1, i2;
+	INT_PAIR * pair;
+
+	if (rhsItem->it.itype == IT_SLIST) {
+		rhsItem = rhsItem->sl.first;
+		assert (rhsItem != NULL && rhsItem->it.itype == IT_IDENT);
+		if (e1->ex.etype != ET_SEXPR || e2->ex.etype != ET_SEXPR ||
+		    e1->sx.t->sym.ident != rhsItem->id.id ||
+		    e2->sx.t->sym.ident != rhsItem->id.id)
+			return -1;
+		/*
+		 * rhsItem, e1, and e2 have all been previously parsed/checked
+		 * so we know they have the same arity, kinds, etc.
+		 */
+
+		for (ix = 0, rhsItem = rhsItem->it.next; 
+		     rhsItem != NULL;
+		     rhsItem = rhsItem->it.next, ++ix) {
+			if (djParse (rhsItem, e1->sx.args[ix], e2->sx.args[ix],
+				     tip, nvars, dummies, dmap, rmap) != 0)
+				return -1;
+		}
+		return 0;
+		
+	} else {
+		assert (rhsItem->it.itype == IT_IDENT);
+		if (e1->ex.etype != ET_IVAR || e2->ex.etype != ET_IVAR)
+			return -1;
+
+		ex = mapVal (rhsItem->id.id, tip->varIndex);
+		assert (ex != NULL && ex->ex.etype == ET_IVAR);
+		ix = ex->vi.index;
+		i1 = e1->vi.index;
+		i2 = e2->vi.index;
+		if (ix < nvars - dummies) {
+			/* A non-dummy variable */
+			if (i1 != ix || i2 != ix)
+				return -1;
+			return 0;
+		}
+		/* OK, ex is a dummy, e1 and e2 can't be non-dummies,
+		 * and can't be equal.
+		 */
+		if (i1 < nvars - dummies || i2 < nvars - dummies || i1 == i2)
+			return -1;
+		me = mapElemInsert ((void *)(size_t)ix, dmap);
+		if (me == NULL) {
+			ALLOC_ERR();
+			return -1;
+		}
+		if (me->v.p == NULL) {
+			pair = arenaAlloc (&tip->arena, sizeof (*pair));
+			if (pair == NULL) {
+				ALLOC_ERR();
+				return -1;
+			}
+			pair->i1 = i1;
+			pair->i2 = i2;
+			me->v.p = pair;
+			me1 = mapElemInsert ((void *)(size_t)i1, rmap);
+			if (me1 == NULL) {
+				ALLOC_ERR();
+				return -1;
+			}
+			me2 = mapElemInsert ((void *)(size_t)i2, rmap);
+			if (me2 == NULL) {
+				ALLOC_ERR();
+				return -1;
+			}
+			if (me1->v.p != NULL || me2->v.p != NULL) {
+				fprintf (stderr,
+					 "*** Reused dummy variable\n");
+				return -1;
+			}
+			me1->v.p = pair;
+			me2->v.p = pair;
+			return 0;
+		}
+		pair = me->v.p;
+		if (pair->i1 != i1 || pair->i2 != i2)
+			return -1;
+		return 0;
+	}
+}
+
+typedef struct _DEFDV
+{
+	int nondummies;
+	MAPPING * rmap;
+	int i, j;       /* failure case */
+} DEFDV;
+
+static void *
+checkDvsForDef (int i, int j, void * ctx)
+{
+	DEFDV * dv = ctx;
+	INT_PAIR * pairi;
+	INT_PAIR * pairj;
+
+	/* Note, i < j */
+	if (j < dv->nondummies) {
+		fprintf (stderr,
+			 "*** DV condition involves two non-dummies in "
+			 "definition justification proof:");
+		goto checkDvsForDef_bad;
+	}
+
+	pairj = mapVal ((void *)(size_t)j, dv->rmap);
+	if (pairj == NULL)
+		return NULL; /* OK, j is neither def-dummy nor a def arg.
+				No restrictions on its DV conditions. */
+
+	pairi = mapVal ((void *)(size_t)i, dv->rmap);
+	if (pairi == NULL)
+		return NULL; /* OK, i is not a def-dummy, and j is a def-dummy.
+				(i j) is an allowed DV condition. */
+
+	/* Both i and j were definition dummies in one of the RHS variants.
+	 * They must be in the same RHS variant.
+	 */
+	if ((i == pairi->i1 && j == pairj->i1) ||
+	    (i == pairi->i2 && j == pairj->i2))
+		return NULL;	/* i, j belong to the same RHS variant */
+
+	fprintf (stderr, "*** DV condition involves two dummies in different\n"
+		         "    definition RHS variants:");
+
+checkDvsForDef_bad:
+	dv->i = i; /* record failure case */
+	dv->j = j;
+	return dv; /* arbitrary non-NULL */
+}
+
+static int
+defJustVerify (SHULLIVAN * shul, STATEMENT_PARSE_CONTEXT * sctx, TIP * tip,
+	       ITEM * rhsItem, int nvars, int dummies)
+{
+	MAPPING * dmap;
+	MAPPING * rmap;
+	DEFDV dv;
+	int result;
+
+	if (tip->ps.count != 2) {
+		fprintf (stderr, 
+			 "Excess expressions on proof stack.\n");
+		tipShow (stderr, tip, shul->verbose);
+		return -1;
+	}
+	dmap = mappingCreate (NULL);
+	if (dmap == NULL) {
+		ALLOC_ERR();
+		return -1;
+	}
+	rmap = mappingCreate (NULL);
+	if (rmap == NULL) {
+		ALLOC_ERR();
+		result = -1;
+		goto defJustVerify_bad1;
+	}
+	result = djParse (rhsItem, tip->ps.exprs[0], tip->ps.exprs[1],
+			  tip, nvars, dummies, dmap, rmap);
+	if (result != 0) {
+		fprintf (stderr, 
+			 "In definition justification proof, def_just "
+			 "variables not substituted properly.\n");
+		goto defJustVerify_bad2;
+	}
+
+	/*
+	 * OK, at this point, if result == 0, we know that both RHS
+	 * variants do in fact match the prototype RHS, and that completely
+	 * different sets of definition dummies are used on the two sides.
+	 * Now check the distinct variables requirements imposed by the proof.
+	 */
+
+	dv.nondummies = nvars - dummies;
+	dv.rmap = rmap;
+
+	result = 0;
+	if (dvEnumerate (tip->varIndex->size, shul->dvbits,
+			 checkDvsForDef, &dv) != NULL) {
+		/* Disallowed DV pair occurred. Print out the pair. */
+		fprintf (stderr, " (%s %s)\n",
+			 sctx->ec.vars[dv.i].id->name,
+			 sctx->ec.vars[dv.j].id->name);
+		result = -1;
+	}
+
+defJustVerify_bad2:
+	mappingDelete (rmap, NULL, NULL);
+
+defJustVerify_bad1:
+	mappingDelete (dmap, NULL, NULL);
+	return result;
+}
+
 static int
 load_def (SHULLIVAN * shul, ITEM * arg, void * ctx)
 {
 	ITEM * lhsItem;
 	ITEM * rhsItem;
 	ITEM * nameItem;
+	ITEM * proofItem;
 	ITEM * item;
 	DEF * def;
 	IDENT * id;
@@ -5875,7 +6380,9 @@ load_def (SHULLIVAN * shul, ITEM * arg, void * ctx)
 	int arity;
 	int dummies;
 	int nvars;
-	EXPR_PARSE_CONTEXT parseCtx;
+	STATEMENT_PARSE_CONTEXT sctx;
+	EXPR_PARSE_CONTEXT * parseCtx = &sctx.ec;
+	TIP tip;
 	size_t size;
 	int i;
 
@@ -5884,10 +6391,9 @@ load_def (SHULLIVAN * shul, ITEM * arg, void * ctx)
 	    lhsItem->it.itype != IT_SLIST ||
 	    (nameItem = lhsItem->sl.first) == NULL ||
 	    nameItem->it.itype != IT_IDENT ||
-	    (rhsItem = lhsItem->it.next) == NULL ||
-	    rhsItem->it.next != NULL) {
+	    (rhsItem = lhsItem->it.next) == NULL) {
 		fprintf (stderr, "*** Expected "
-			 "'def ((NAME [VAR ...]) RHS)'\n");
+			 "'def ((NAME [VAR ...]) RHS [(STEP ...)])'\n");
 		return -1;
 	}
 
@@ -5900,19 +6406,10 @@ load_def (SHULLIVAN * shul, ITEM * arg, void * ctx)
 
 	/* we'll set me->v.p after we count the variables */
 
-	parseCtx.terms = shul->terms;
-	parseCtx.syms = shul->syms;
-	parseCtx.vars = shul->vi.buf;
-	parseCtx.varsSize = shul->vi.size / sizeof (EXPR_VARINFO);
-	parseCtx.vargb = &shul->vi;
-	parseCtx.nTermExps = 0;
-	parseCtx.nDefExps = 0;
-	parseCtx.nVarExps = 0;
-	parseCtx.pMem = 0;
+	parseCtx->terms = shul->terms;
+	parseCtx->syms = shul->syms;
 
-	parseCtx.varIndex = shul->varIndex;
-	assert (parseCtx.varIndex->size == 0);
-	parseCtx.varIndex->defval.i = -1; /* set default value */
+	exprParseCtxInit (parseCtx, shul);
 
 	arity = 0;
 	for (item = nameItem->it.next; 
@@ -5923,14 +6420,14 @@ load_def (SHULLIVAN * shul, ITEM * arg, void * ctx)
 				 "variable identifier.\n");
 			goto load_def_bad1;
 		}
-		if (arity >= parseCtx.varsSize &&
-		    growParseVars (&parseCtx) != 0) {
+		if (arity >= parseCtx->varsSize &&
+		    growParseVars (parseCtx) != 0) {
 			goto load_def_bad1;
 		}
 		me = mapElemInsert (item->id.id,
-				    parseCtx.varIndex);
+				    parseCtx->varIndex);
 		if (me == NULL) {
-			perror ("load_def:mapElemInsert");
+			ALLOC_ERR ();
 			goto load_def_bad1;
 		}
 		if (me->v.i != -1) {
@@ -5939,26 +6436,57 @@ load_def (SHULLIVAN * shul, ITEM * arg, void * ctx)
 				 "parameter '%s'.\n", (char *)me->obj);
 			goto load_def_bad1;
 		}
-		parseCtx.vars[arity].index = arity;
-		parseCtx.vars[arity].id = item->id.id;
-		parseCtx.vars[arity].ex.etype = ET_IVAR;
-		parseCtx.vars[arity].ex.kind = NULL;
+		parseCtx->vars[arity].index = arity;
+		parseCtx->vars[arity].id = item->id.id;
+		parseCtx->vars[arity].ex.etype = ET_IVAR;
+		parseCtx->vars[arity].ex.kind = NULL;
 		me->v.i = arity++;
 	}
 
-	if (exprParse1 (rhsItem, &parseCtx, NULL) != 0) {
+	if (exprParse1 (rhsItem, parseCtx, NULL) != 0) {
 		fprintf (stderr,
 			 "*** bad definition RHS.\n");
 		goto load_def_bad1;
 	}
 
-	nvars = parseCtx.varIndex->size;
+	nvars = parseCtx->varIndex->size;
 	dummies = nvars - arity;
 
-	if (varDefaultKinds (parseCtx.vars, nvars,
+	if (varDefaultKinds (parseCtx->vars, nvars,
 			     (shul->flags & LOOSE_VAR_KINDS),
 			     shul->syms) != 0)
 		goto load_def_bad1;
+
+	proofItem = rhsItem->it.next;
+	if ((shul->flags & DEF_JUSTIFY) != 0) {
+		if (proofItem != NULL) {
+			if (dummies == 0) {
+				fprintf (stderr, 
+					 "*** Definition %s has no dummy "
+					 "vars, justification proof must be "
+					 "absent.\n",
+					 nameItem->id.id->name);
+				goto load_def_bad1;
+			}
+			if (proofItem->it.itype != IT_SLIST ||
+			    proofItem->it.next != NULL) {
+				fprintf (stderr, 
+					 "*** Expected 'def ((NAME [VAR ...]) "
+					 "RHS CONC (STEP ...))'\n");
+				goto load_def_bad1;
+			}
+		} else if (dummies != 0) {
+			fprintf (stderr, "*** Definition %s has dummy vars, "
+				 "justification proof is required.\n",
+				 nameItem->id.id->name);
+			goto load_def_bad1;
+		}
+	} else if (proofItem != NULL) {
+		fprintf (stderr, "*** Expected "
+			 "'def ((NAME [VAR ...]) RHS)'\n");
+		goto load_def_bad1;
+	}
+
 
 	/*
 	 * OK, now we know all the parameter variables and dummies
@@ -5969,10 +6497,10 @@ load_def (SHULLIVAN * shul, ITEM * arg, void * ctx)
 
 	size = (offsetof (DEF, vi) + 
 		nvars * sizeof (EXPR_VARINFO) +
-		((parseCtx.nTermExps + parseCtx.nDefExps)
+		((parseCtx->nTermExps + parseCtx->nDefExps)
 		 * offsetof (S_EXPR, args)) +
-		(parseCtx.nTermExps + parseCtx.nDefExps +
-		 parseCtx.nVarExps - 1) * sizeof (EXPR *) +
+		(parseCtx->nTermExps + parseCtx->nDefExps +
+		 parseCtx->nVarExps - 1) * sizeof (EXPR *) +
 		arity * sizeof (KIND *));
 
 	def = malloc (size);
@@ -5990,12 +6518,12 @@ load_def (SHULLIVAN * shul, ITEM * arg, void * ctx)
 	def->ndummies = dummies;
 
 	for (i = 0; i < nvars; ++i) {
-		def->vi[i] = parseCtx.vars[i];
+		def->vi[i] = parseCtx->vars[i];
 		def->vi[i].id->refcount++; /* hang on to it */
 	}
 
-	parseCtx.varIndex->defval.p = NULL;
-	(void)mappingEnumerate (parseCtx.varIndex, varIndexRemap, def->vi);
+	parseCtx->varIndex->defval.p = NULL;
+	(void)mappingEnumerate (parseCtx->varIndex, varIndexRemap, def->vi);
 
 	def->t.kinds = (KIND **)&def->vi[nvars];
 
@@ -6003,17 +6531,71 @@ load_def (SHULLIVAN * shul, ITEM * arg, void * ctx)
 		def->t.kinds[i] = def->vi[i].ex.kind; /* redundant... */
 	}
 
-	parseCtx.pMem = (char *)&def->t.kinds[arity];
+	parseCtx->pMem = (char *)&def->t.kinds[arity];
 
-	def->expr = exprParse2 (rhsItem, &parseCtx);
+	def->expr = exprParse2 (rhsItem, parseCtx);
 	assert (def->expr != NULL && def->expr->ex.kind != NULL &&
-		parseCtx.pMem == (char *)def + size);
+		parseCtx->pMem == (char *)def + size);
 
 	def->t.kind = def->expr->ex.kind; /* redundant... */
 
+	if (proofItem != NULL) {
+		int pairs;
+		int allvars;
+
+		printf ("checking justification for definition of %s\n",
+			nameItem->id.id->name);
+		/* check definition justification proof */
+
+		sctx.iface = NULL;
+		/* Create an empty hypothesis list */
+		if ((sctx.hypnams = mappingCreate (NULL)) == NULL) {
+			ALLOC_ERR ();
+			goto load_def_bad2;
+		}
+		sctx.hypnams->defval.i = -1;
+		sctx.proofStepItem = proofItem->sl.first;
+		sctx.hypItem = NULL; /* no hypotheses */
+
+		i = proof1 (shul, &sctx, &tip, NULL);
+		identTableDelete (sctx.hypnams); /* not needed any more */
+
+		/* proof1() checked that the last step of the proof
+		 * was a definition justification step.  Check that
+		 * exactly 2 items remain on the proof stack, which
+		 * must be the the two RHS versions.  Check that the
+		 * two expressions do in fact match the RHS; we require
+		 * that non-dummy variables match exactly, while
+		 * dummies may differ; and a completely different
+		 * dummy variable set must be used for each RHS.
+		 * Then check the distinct variables requirements
+		 * generated in the proof.  DV conditions are allowed
+		 * between def dummies and non dummies, or between
+		 * def dummies and other def dummies in the same
+		 * RHS variant, or between any variable and an ordinary
+		 * proof dummy that does not occur in one of the RHSs.
+		 * DV pairs are not allowed between two non-dummy vars,
+		 * or between def dummies occurring in different RHSs.
+		 */
+
+		if (i == 0)
+			i = defJustVerify (shul, &sctx, &tip,
+					   rhsItem, nvars, dummies);
+
+		/* clear dvbits here when we know how many pairs we might
+		   have */
+
+		allvars = sctx.ec.varIndex->size;
+		pairs = allvars * (allvars - 1) / 2;
+		memset (shul->dvbits, 0, BIT_MAP_SIZE(pairs));
+
+		if (i != 0)
+			goto load_def_bad2;
+	}
+
 	me = mapElemInsert (id, shul->terms);
 	if (me == NULL) {
-		perror ("load_def:mapElemInsert");
+		ALLOC_ERR ();
 		goto load_def_bad2;
 	}
 	assert (me->v.p == NULL); /* we checked above */
@@ -6025,7 +6607,7 @@ load_def (SHULLIVAN * shul, ITEM * arg, void * ctx)
 
 	id->refcount++; /* the definition identifier */
 
-	mappingEmpty (parseCtx.varIndex, NULL, NULL);
+	mappingEmpty (parseCtx->varIndex, NULL, NULL);
 
 	return 0;
 
@@ -6039,7 +6621,7 @@ load_def_bad2:
 	free (def);
 
 load_def_bad1:
-	mappingEmpty (parseCtx.varIndex, NULL, NULL);
+	mappingEmpty (parseCtx->varIndex, NULL, NULL);
 
 	return -1;
 	
@@ -6106,7 +6688,7 @@ load_kindbind (SHULLIVAN * shul, ITEM * arg, void * ctx)
 
 	me = mapElemInsert (k2Item->id.id, shul->kinds);
 	if (me == NULL) {
-		perror ("load_kindbind:mapElemInsert"); /* alloc failure */
+		ALLOC_ERR ();
 		goto load_kindbind_bad1;
 	}
 	if (me->v.p != NULL) {
@@ -6636,7 +7218,7 @@ main (int argc, char * argv [])
 	    (shul.kinds = mappingCreate(NULL)) == NULL ||
 	    (shul.fvi = mappingCreate (NULL)) == NULL ||
 	    (shul.fvj = mappingCreate (NULL)) == NULL) {
-		perror ("allocation failure");
+		ALLOC_ERR ();
 		/* for now, rely on unix to clean up after us */
 		return 1;
 	}
@@ -6674,15 +7256,36 @@ main (int argc, char * argv [])
 	}
 
 	if (interactive) {
+		char * val;
+
 		printf ("Shullivan version %s. "
 			"Enter 'help' for help.\n", SHULLIVAN_VERSION);
-		rl_bind_key ('\t', rl_insert);
-		rl_bind_key ('\n', rl_insert);
-		scannerInit (&scan, 
-			     readlineScan, shulPrompt, 
-			     freeLine,
-			     scanToken, readlinePromptSet,
-			     scanCleanup);
+
+		/* 
+		 * realine doesn't work well in the emacs shell, which
+		 * provides the desired functionality anyhow.
+		 */
+		if ((val = getenv ("EMACS")) &&
+		    strcmp (val, "t") == 0 &&
+		    (val = getenv ("TERM")) &&
+		    strcmp (val, "dumb") == 0) {
+
+			scannerInit (&scan, 
+				     simpleScan, shulPrompt, 
+				     freeLine,
+				     scanToken, readlinePromptSet,
+				     scanCleanup);
+
+		} else {
+			rl_bind_key ('\t', rl_insert);
+			rl_bind_key ('\n', rl_insert);
+
+			scannerInit (&scan, 
+				     readlineScan, shulPrompt, 
+				     freeLine,
+				     scanToken, readlinePromptSet,
+				     scanCleanup);
+		}
 		do {
 			result = command (&shul, &scan);
 		} while (result > COMMAND_EOF);

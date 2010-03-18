@@ -1,4 +1,7 @@
 Changes in 0.06:
+ - Clean up some warnings seen in 64-bit builds.
+ - Support requiring justification for definitions with dummy variables.
+ - Run in emacs shell
  - Support flag (REQ_MULT_CONC_SYNTAX) requiring use of the multiple
    conclusions syntax.
 

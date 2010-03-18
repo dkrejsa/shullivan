@@ -3,7 +3,7 @@
 #ifndef __INCshullivanh
 #define __INCshullivanh
 
-#define SHULLIVAN_VERSION "0.05"
+#define SHULLIVAN_VERSION "0.06"
 
 /*
  * Lexical items - identifiers and s-lists
@@ -156,6 +156,7 @@ typedef enum _SYMBOL_TYPE {
 
 	ST_STMT,	/* Statement name */
 	ST_VAR,		/* Variable name */
+	ST_DEFJUST,	/* Definition justification rule */
 } SYMBOL_TYPE;
 
 struct _SYMBOL {
@@ -366,7 +367,6 @@ typedef struct _ENVIRONMENT {
 
 typedef struct _TIP {
 	THEOREM *	t;
-	STATEMENT *	s;	/* shortcut to t->stmt */
 	EXPR_STACK	ps;	/* the proof stack (list?) */
 	EXPR_STACK	wvs;	/* stack for wild variable substitutions */
 	IDENT_TABLE *   hypnams;	/* hypothesis name lookup table */
