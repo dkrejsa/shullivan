@@ -8,7 +8,8 @@ RM		= rm -f
 #LD		= ld
 # Use the compiler for linking also
 LD		= $(CC)
-LIBFLAGS	= -lreadline -ltermcap
+# LIBFLAGS	= -lreadline -ltermcap
+LIBFLAGS	= -lreadline
 LDFLAGS		= $(LIBFLAGS)
 
 OBJS	= shullivan.o shul_ident.o map.o arena.o

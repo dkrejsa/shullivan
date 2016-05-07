@@ -1,6 +1,7 @@
 Here's an example shullivan session. Note that since readline
 is used to edit the partial proofs, one doesn't have to retype
-the whole proof so far to change it.
+the whole proof so far to change it.  I suggest using 'Ctrl-J'
+to enter line-feeds within an editable 'line'.
 
 
 [dlkrejsa@clifford shullivan]$ export GHILBERT_PATH=/home/dlkrejsa/src/ghilbert

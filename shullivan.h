@@ -11,11 +11,11 @@
  * than '(' and ')' and '#', without any interpretation of its use as a
  * kind, variable, term name, theorem or axiom name, or hypothesis
  * name.
- * 
+ *
  * (Ugh: identifiers are currently also used as file names, and there's
  * no way to escape a space character or other special character in
  * a file name.)
- * 
+ *
  * IDENT := id-char | id-char IDENT
  *
  * An s-list is the lexical format of an s-expression, without the type
@@ -23,13 +23,13 @@
  * allow "()", "((whee) 7)", and other expressions which couldn't be
  * valid ghilbert terms, because the first member of the list isn't an
  * ident/term symbol.
- * 
+ *
  * COMMENT_WS := '#' NON_NEWLINES '\n'
  * NON_NEWLINES := empty | non-'\n'-character NON_NEWLINES
  * WS_CHAR := whitespace-character | COMMENT_WS
  * WS := WS_CHAR | WS_CHAR WS
  * OWS := empty | WS
- * 
+ *
  * A comment is also allowed to terminate at EOF without the trailing
  * '\n'.
  *
@@ -220,7 +220,7 @@ typedef struct _DEF {
 typedef struct _S_EXPR {
 	EXPR_CORE ex;	/* ex.type = ET_SEXPR */
 	TERM * t;
-	EXPR * args[1];	/* Variable length. Array of t->arity 
+	EXPR * args[1];	/* Variable length. Array of t->arity
 			   EXPR *'s */
 } S_EXPR;
 
@@ -267,11 +267,11 @@ union _EXPR {
 #define PAIRNUM(i, j) (((j) * ((j) - 1) / 2) + (i))
 
 #define BIT(m, x) \
-  ((m)[(x)/BITMAP_WORDBITS] & (1 << ((x) & (BITMAP_WORDBITS - 1)))) 
+  ((m)[(x)/BITMAP_WORDBITS] & (1 << ((x) & (BITMAP_WORDBITS - 1))))
 #define BIT_SET(m, x) \
-  ((m)[(x)/BITMAP_WORDBITS] |= (1 << ((x) & (BITMAP_WORDBITS - 1)))) 
+  ((m)[(x)/BITMAP_WORDBITS] |= (1 << ((x) & (BITMAP_WORDBITS - 1))))
 #define BIT_CLR(m, x) \
-  ((m)[(x)/BITMAP_WORDBITS] &= ~(1 << ((x) & (BITMAP_WORDBITS - 1)))) 
+  ((m)[(x)/BITMAP_WORDBITS] &= ~(1 << ((x) & (BITMAP_WORDBITS - 1))))
 
 typedef struct _THEOREM THEOREM;
 
@@ -289,7 +289,7 @@ typedef struct _STATEMENT {
 	uint32_t *	dvbits; /* pointer to distinct var bitmap */
 	THEOREM *	thm;	/* NULL unless this is a theorem */
 
-	EXPR_VARINFO vi [1];	/* 
+	EXPR_VARINFO vi [1];	/*
 				   Variable length array. Must be last.
 				   Information for the nhvars +
 				   nWild variables (in order with
