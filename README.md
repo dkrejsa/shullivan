@@ -1,9 +1,24 @@
-Here's an example shullivan session. Note that since readline
-is used to edit the partial proofs, one doesn't have to retype
-the whole proof so far to change it.  I suggest using 'Ctrl-J'
-to enter line-feeds within an editable 'line'.
+# Shullivan
 
+Shullivan is an implementation in C of the original Ghilbert language and proof
+verification system by Raph Levien, with a few optional enhancements.  Ghilbert
+was in turn inspired by Metamath.  Shullivan's main claim to fame is that it is
+much faster at verification than the original python Ghilbert implementation.
 
+Shullivan comes with a simple Makefile that probably needs to be adapted
+to particular environments.  As of May 7 2016, Shullivan builds without
+warnings on Arch Linux.  Other than a minor amount of maintenance to get
+shullivan to build before uploading it to github, I have done no work on
+shullivan in a long time and do not currently have plans to work on it in
+the future.  Note that Ghilbert itself has moved on since the days in which
+shullivan was written.
+
+Here's an example shullivan session, making use of the (old) Ghilbert pax library.
+Note that since readline is used to edit the partial proofs, one doesn't have
+to retype the whole proof so far to change it.  (I suggest using 'Ctrl-J'
+to enter line-feeds within an editable 'line'.)
+
+```
 [dlkrejsa@clifford shullivan]$ export GHILBERT_PATH=/home/dlkrejsa/src/ghilbert
 [dlkrejsa@clifford shullivan]$ ./shul
 Shullivan version 0.01. Enter 'help' for help.
@@ -138,3 +153,4 @@ verifying syl
 verifying com12
 shul=> exit
 Cheerio!
+```
